@@ -650,7 +650,7 @@ class RedisMeta:
 
     def init_meta(self, node_id: Optional[int] = None) -> Optional[int]:
         """Initialize Redis metadata. This method is thread-safe and can only be called once per instance.
-        
+
         Args:
             node_id: claim this id (the radixshmem cluster rank) instead of
                 allocating one from `global:node_id`
@@ -681,7 +681,7 @@ class RedisMeta:
                 self._node_id = node_id
                 # initialization phase, scan active nodes first
                 self.nodeinfo.scan_active_nodes()
-
+                
                 # mark as initialized
                 self._initialized = True
                 
