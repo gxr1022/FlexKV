@@ -778,9 +778,26 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # via shm channel IPC). When True, KVServer is not started; each DP process
     # builds its own KVTaskEngine and attaches to shared radix regions.
     radix_shmem=bool(int(os.getenv('FLEXKV_RADIX_SHMEM', 0))),
-    # Identifier used to name radix shm regions and TE shm channels. Lets
-    # multiple FlexKV instances coexist on a host.
-    shm_radix_server_id=os.getenv('FLEXKV_SHM_RADIX_ID', 'default'),
+    # Names this FlexKV's radix shm regions and TE shm channels; pass it only to
+    # tell apart several FlexKV instances sharing one node.
+    shm_radix_id=os.getenv('FLEXKV_SHM_RADIX_ID', 'flexkv'),
+    radix_world_size=int(os.getenv('FLEXKV_RADIX_WORLD_SIZE', 1)),
+    # etcd endpoint carrying cluster membership, e.g. "etcd://10.0.0.1:2379".
+    # SHMRADIX_CLUSTER_ID is only the BASE namespace: each tier rendezvouses in
+    # "<base>_<tier>" (shm_radix_bootstrap.cluster_id_for).
+    radix_registry=os.getenv('FLEXKV_RADIX_REGISTRY', ''),
+    # Bootstrap IP peers dial, required when world_size > 1 (interface wins when
+    # both are set); a concrete per-node address, since it also derives the identity.
+    radix_rpc_address=os.getenv('FLEXKV_RADIX_RPC_ADDRESS', ''),
+    radix_rpc_interface=os.getenv('FLEXKV_RADIX_RPC_INTERFACE', ''),
+    radix_rdma_dev=os.getenv('FLEXKV_RADIX_RDMA_DEV', ''),
+    radix_gid_idx=int(os.getenv('FLEXKV_RADIX_GID_IDX', 3)),
+    radix_bootstrap_timeout_sec=int(os.getenv(
+        'FLEXKV_RADIX_BOOTSTRAP_TIMEOUT_SEC', 120
+    )),
+    # Control-plane transport for remote ops: "zmq" (TCP) or "dc" (RDMA DC,
+    # needs mlx5). Rank 0 is authoritative and broadcasts its choice.
+    radix_remote_op_transport=os.getenv('FLEXKV_RADIX_REMOTE_OP_TRANSPORT', 'dc'),
     # Extra shm TE channels reserved beyond the internal DP clients
     # (total_clients = instance_num * dp_size). External processes (e.g. a
     # prefetch controller attaching to the shared radix index) submit graphs to

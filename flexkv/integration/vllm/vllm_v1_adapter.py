@@ -1,7 +1,7 @@
 import os
 import time
 from typing import TYPE_CHECKING, Optional, Literal, Iterable, Any, List
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from abc import ABC, abstractmethod
 
 import numpy as np
@@ -1004,28 +1004,26 @@ class FlexKVConnectorV1Impl:
             # Track scheduled requests to detect preemptions in build_connector_meta
             self.previous_scheduled_req_ids: set[str] = set()
         elif role == KVConnectorRole.WORKER:
-            # Neither rank is knowable from the config on the worker side:
-            #   * vllm's ParallelConfig has no ``tensor_parallel_rank`` field, so
-            #     the tp_rank read in post_init_from_vllm_config is always 0.
-            #   * the mp executor passes ``local_rank`` to the worker as a kwarg
-            #     and never exports LOCAL_RANK, so the
-            #     ``int(os.environ.get('LOCAL_RANK', -1))`` in
-            #     integration/config.py yields -1 and RankInfo.__post_init__
-            #     derives local_rank from tp_rank=0 -> 0.
-            # local_rank is what becomes device_id, so leaving it at 0 makes
-            # every worker register the same device_id and GPU registration
-            # never reaches expected_gpus.  Recover both from the initialized
-            # process groups.  local_rank must be set explicitly:
-            # dataclasses.replace re-runs __post_init__, but by then local_rank
-            # is 0 (not < 0) so it is never re-derived.
+            # vllm's ParallelConfig has no ``tensor_parallel_rank`` field, so
+            # the value read in post_init_from_vllm_config is always 0 on every
+            # worker.  Override it here using the initialized TP group rank so
+            # each worker registers a distinct device_id with FlexKV.
+            #
+            # ``local_rank`` has to be reset together with it: RankInfo derives
+            # local_rank only when it is negative, so a replace() that carried
+            # the stale 0 over would leave every worker registering
+            # device_id=0 and the GPU registry would wait forever for the
+            # TP>1 devices that never arrive.  vllm's MultiprocExecutor does
+            # not export LOCAL_RANK, so the fresh tp_rank is the only source;
+            # an explicitly exported LOCAL_RANK (torchrun / ray launchers)
+            # stays authoritative.
             try:
-                import dataclasses
-                from vllm.distributed.parallel_state import (get_tp_group,
-                                                             get_world_group)
-                rank_info = dataclasses.replace(
-                    rank_info,
-                    tp_rank=get_tp_group().rank_in_group,
-                    local_rank=get_world_group().local_rank)
+                overrides: dict[str, int] = {
+                    "tp_rank": get_tp_group().rank_in_group
+                }
+                if int(os.environ.get("LOCAL_RANK", -1)) < 0:
+                    overrides["local_rank"] = -1
+                rank_info = replace(rank_info, **overrides)
             except Exception as _e:
                 logger.error(
                     f"FlexKV: could not derive ranks from vllm process groups: "

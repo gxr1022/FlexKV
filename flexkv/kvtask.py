@@ -177,7 +177,10 @@ class KVTaskManager:
                       and shm_te_channel_id is not None)
         if use_shm_te and not self.model_config.use_trtllm_subprocess:
             self.transfer_handles = [TransferManagerHandle(
-                model_config_for_transfer,
+                # Left behind by a rename: the sibling "process" branch below
+                # passes `model_config`, and no *_for_transfer variant exists —
+                # so the shm-TE path (radix_shmem) NameError'd on first use.
+                model_config,
                 self.cache_config,
                 mode="shm",
                 gpu_register_port=gpu_register_port,
