@@ -314,6 +314,7 @@ class KVManager:
                 token_ids=token_ids,
                 slot_mapping=slot_mapping,
                 token_mask=token_mask,
+                dp_client_id=self.dp_client_id,
                 namespace=namespace,
             )
         return task_id
@@ -347,6 +348,7 @@ class KVManager:
                 token_ids=token_ids,
                 token_mask=token_mask,
                 cpu_only=cpu_only,
+                dp_client_id=self.dp_client_id,
                 namespace=namespace,
                 swa_aware=swa_aware,
             )
@@ -372,6 +374,7 @@ class KVManager:
                 token_ids=token_ids,
                 slot_mapping=slot_mapping,
                 token_mask=token_mask,
+                dp_client_id=self.dp_client_id,
                 namespace=namespace,
             )
         return task_id
@@ -392,6 +395,7 @@ class KVManager:
             task_id, mask = self.kv_task_engine.put_match(
                 token_ids=token_ids,
                 token_mask=token_mask,
+                dp_client_id=self.dp_client_id,
                 namespace=namespace,
             )
         return task_id, mask
@@ -421,6 +425,7 @@ class KVManager:
         else:
             task_id = self.kv_task_engine.prefetch_async(
                 token_ids,
+                dp_client_id=self.dp_client_id,
                 namespace=namespace,
                 swa_aware=swa_aware,
             )
