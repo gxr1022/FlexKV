@@ -474,7 +474,7 @@ def _global_cache_engine(enable_ssd: bool = False, enable_gds: bool = False):
 
     model_config = ModelConfig(
         num_layers=2, num_kv_heads=4, head_size=64,
-        dtype=torch.float16, use_mla=False, tp_size=1, dp_size=1,
+        dtype=torch.float16, tp_size=1, dp_size=1,
     )
     cache_config = CacheConfig(
         tokens_per_block=TOKENS_PER_BLOCK,
@@ -1043,7 +1043,7 @@ def _swa_global_engine(swa_slots: int = 2 * SWA_W,
                                          window_blocks=window_blocks)
         cache_config.enable_swa_transfer = True
         model_config = ModelConfig(num_layers=2, num_kv_heads=4, head_size=64,
-                                   dtype=torch.float16, use_mla=False,
+                                   dtype=torch.float16,
                                    tp_size=1, dp_size=1)
         # Hold the owner handle until teardown: dropping it unlinks the region.
         owners = create_shm_radix_regions(cache_config,

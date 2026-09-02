@@ -73,7 +73,7 @@ def _tp_client_proc(dp_client_id, tp_rank, server_recv_port,
         tokens_per_block=cache_config.tokens_per_block,
         num_head=model_config.num_kv_heads // model_config.tp_size,
         head_size=model_config.head_size,
-        is_mla=model_config.use_mla,
+        kv_dim=model_config.kv_dim,
     )
     gpu_blocks = [
         torch.empty(size=tuple(gpu_layout.kv_shape[1:]),
@@ -103,7 +103,7 @@ def _make_configs(dp_size: int, ssd_dir: str):
     from flexkv.common.config import ModelConfig, CacheConfig
     model_config = ModelConfig(
         num_layers=2, num_kv_heads=4, head_size=128,
-        dtype=torch.float16, use_mla=False, tp_size=1, dp_size=dp_size,
+        dtype=torch.float16, tp_size=1, dp_size=dp_size,
     )
     cache_config = CacheConfig(
         tokens_per_block=TOKENS_PER_BLOCK, enable_cpu=True, enable_ssd=True,
