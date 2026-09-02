@@ -283,6 +283,141 @@ def test_local_range_intersects_the_window():
     assert match.local_range(0, 4).tolist() == [40, 41, 42, 43]
 
 
+SWA_W = 8  # == flexkv.common.config.RADIX_SWA_WINDOW_BLOCKS, literal on purpose:
+           # a drive-by change to the constant should fail here, visibly.
+JOINT_MASK = (_engine_mod.COMPONENT_MASK_FULL |
+              _engine_mod.COMPONENT_MASK_SWA)
+_SWA = shmradix.ComponentType.SWA
+
+
+def _make_swa_engine(name: str, blocks: int = 2000, swa_slots: int = 64,
+                     tokens_per_block: int = 16):
+    """A single region carrying the SWA component, and an engine that knows it.
+
+    Regions land on hugepages when the host has them, so stale-state sweeping
+    covers both backings (`_make_engine` predates the SWA work and only sweeps
+    /dev/shm).
+    """
+    from flexkv.common.config import SWAPoolConfig
+    for root in ("/dev/shm", "/dev/hugepages"):
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(f"{root}{name}")
+    cfg = shmradix.ShmConfig(
+        max_nodes=blocks * 4,
+        max_blocks=blocks,
+        block_size=tokens_per_block,
+        component_mask=JOINT_MASK,
+        swa_window_blocks=SWA_W,
+        swa_max_blocks=swa_slots,
+    )
+    server = shmradix.RadixServer(name, cfg)
+    engine = CacheEngineRadixShmem(
+        device_type=DeviceType.CPU,
+        num_total_blocks=blocks,
+        tokens_per_block=tokens_per_block,
+        shm_name=name,
+        swa_config=SWAPoolConfig(enabled=True, num_slots=swa_slots),
+    )
+    return engine, server
+
+
+def _publish_full(engine, seq, num_blocks: int) -> np.ndarray:
+    slots = engine.take(num_blocks)
+    engine.insert(seq, slots, num_insert_blocks=num_blocks)
+    return slots
+
+
+def _publish_swa(engine, seq, path_end: int) -> np.ndarray:
+    k = min(path_end, SWA_W)
+    slots = engine.take(k, strict=False, component=_SWA)
+    assert len(slots) == k, "SWA pool unexpectedly short in test setup"
+    engine.insert(seq, slots, num_insert_blocks=path_end, component=_SWA)
+    return slots
+
+
+def test_swa_window_invisible_until_published_then_joint_hit():
+    """§5 test 1 + test 2's visibility half: with `common_hit=20` the Full slots
+    cover [0, 20) and the SWA slots cover [12, 20) -- and before insert(SWA),
+    the joint query matches NOTHING even though Full alone matches 20."""
+    engine, _server = _make_swa_engine("/cers_swa_basic")
+    seq = FakeSeq(block_hashes=_hashes(41, 20), tokens_per_block=16)
+
+    _publish_full(engine, seq, 20)
+
+    match = engine.match(seq, with_peer=False)
+    assert match.num_matched_blocks == 20
+    assert len(match.swa_slots) == 0 and match.swa_start == 0
+    match.release()
+    match = engine.match(seq, with_peer=False, component_mask=JOINT_MASK)
+    assert match.num_matched_blocks == 0
+    assert len(match.swa_slots) == 0
+    match.release()
+
+    swa_slots = _publish_swa(engine, seq, path_end=20)
+
+    match = engine.match(seq, with_peer=False, component_mask=JOINT_MASK)
+    assert match.num_matched_blocks == 20           # joint common hit
+    assert match.num_local_blocks == 20             # Full covers [0, 20)
+    assert match.swa_start == 12                    # max(0, 20 - 8)
+    assert len(match.swa_slots) == SWA_W            # window covers [12, 20)
+    assert sorted(match.swa_slots.tolist()) == sorted(swa_slots.tolist())
+    match.release()
+
+
+def test_swa_short_path_window_starts_at_zero():
+    """A path shorter than W publishes a window over the whole path: k=n slots,
+    swa_start=0 -- the `k = min(path_end, W)` boundary."""
+    engine, _server = _make_swa_engine("/cers_swa_short")
+    seq = FakeSeq(block_hashes=_hashes(42, 5), tokens_per_block=16)
+
+    _publish_full(engine, seq, 5)
+    _publish_swa(engine, seq, path_end=5)
+
+    match = engine.match(seq, with_peer=False, component_mask=JOINT_MASK)
+    assert match.num_matched_blocks == 5
+    assert match.swa_start == 0
+    assert len(match.swa_slots) == 5
+    match.release()
+
+
+def test_swa_take_is_all_or_none_and_the_query_pin_protects_the_window():
+    """`allocate_slots(k, SWA)` returns k slots or NOTHING. With the pool sized
+    to exactly one window, a joint match's pin keeps that window un-evictable
+    (empty take); releasing the pin frees it for eviction (full take)."""
+    engine, _server = _make_swa_engine("/cers_swa_allornone", swa_slots=SWA_W)
+    seq = FakeSeq(block_hashes=_hashes(43, 20), tokens_per_block=16)
+
+    _publish_full(engine, seq, 20)
+    _publish_swa(engine, seq, path_end=20)
+
+    match = engine.match(seq, with_peer=False, component_mask=JOINT_MASK)
+    assert len(match.swa_slots) == SWA_W
+    empty = engine.take(SWA_W, strict=False, component=_SWA)
+    assert len(empty) == 0                          # all pinned -> all or none
+    match.release()
+
+    evicted = engine.take(SWA_W, strict=False, component=_SWA)
+    assert len(evicted) == SWA_W                    # pin gone -> window evictable
+    engine.recycle(evicted, component=_SWA)
+
+
+def test_swa_insert_without_full_path_is_benign_and_recycles():
+    """FULL_PATH_MISSING (Full path evicted/absent under a pending SWA publish)
+    must cost the window, not the task: insert() warns, radixshmem auto-recycles
+    the whole batch, and the pool is whole again."""
+    engine, _server = _make_swa_engine("/cers_swa_orphan", swa_slots=SWA_W)
+    seq = FakeSeq(block_hashes=_hashes(44, 20), tokens_per_block=16)
+
+    swa_slots = engine.take(SWA_W, strict=False, component=_SWA)
+    assert len(swa_slots) == SWA_W
+    # No Full path published: refused with FULL_PATH_MISSING, not raised.
+    engine.insert(seq, swa_slots, num_insert_blocks=20, component=_SWA)
+
+    again = engine.take(SWA_W, strict=False, component=_SWA)
+    assert len(again) == SWA_W                      # auto-recycled, none leaked
+    engine.recycle(again, component=_SWA)
+
+
 # =============================================================================
 # Part 2 — GET planning on the radixshmem backend (`_get_impl_radixshmem`)
 #
@@ -400,7 +535,8 @@ def _force_radixshmem(engine,
 
         # Recording wrapper, not a replacement: the tier's own recycle still runs,
         # so a planner that hands slots back really does free them. `component`
-        # is accepted for signature parity and dropped.
+        # is accepted for signature parity and dropped: these tiers are accel
+        # engines whose recycle knows no component pools.
         def _recycle(physical_block_ids, component=None,
                      _orig=tier.recycle, _sink=aborted):
             _sink.append(np.asarray(physical_block_ids))
@@ -412,10 +548,12 @@ def _force_radixshmem(engine,
     engine.aborted_slots = aborted                  # type: ignore[attr-defined]
 
 
-def _fake_request(num_blocks: int):
-    """(token_ids, token_mask, slot_mapping) for a fully-masked `num_blocks` window."""
+def _fake_request(num_blocks: int, base: int = 0):
+    """(token_ids, token_mask, slot_mapping) for a fully-masked `num_blocks` window.
+
+    `base` offsets the token ids so two requests name distinct sequences."""
     num_tokens = num_blocks * TOKENS_PER_BLOCK
-    token_ids = np.arange(num_tokens, dtype=np.int64)
+    token_ids = np.arange(base, base + num_tokens, dtype=np.int64)
     token_mask = np.ones(num_tokens, dtype=np.bool_)
     # GPU blocks 1000.. so they can't be confused with CPU/SSD slot ids.
     slot_mapping = (
@@ -830,6 +968,342 @@ def test_put_with_fully_cached_window_does_nothing():
     assert not bool(return_mask.any())
     assert engine.inserted_pools == []
     assert engine.aborted_slots == []
+
+
+
+SWA_ENV_BLOCKS = 64
+
+
+@contextlib.contextmanager
+def _swa_global_engine(swa_slots: int = 2 * SWA_W,
+                       num_blocks: int = SWA_ENV_BLOCKS):
+    """A real `GlobalCacheEngine` on a real CPU region with the SWA component.
+
+    Mirrors conftest's `radix_shmem_env` (which is Full-only and module-scoped)
+    but per-test and SWA-enabled: `cache_config.swa` + `enable_swa_transfer`
+    turn on `swa_op_constructor`, and the same config drives the bootstrap, so
+    this also covers the shm_radix_bootstrap side of the design. The pool is
+    small on purpose -- pin-release is asserted through exact take() counts.
+    """
+    try:
+        import torch
+        from flexkv.cache.cache_engine import GlobalCacheEngine
+    except Exception as exc:  # pragma: no cover - environment-dependent
+        pytest.skip(f"GlobalCacheEngine unavailable (needs CUDA + flexkv.c_ext): {exc}")
+
+    from flexkv.common.config import (CacheConfig, GLOBAL_CONFIG_FROM_ENV,
+                                      ModelConfig, SWAPoolConfig)
+    from flexkv.server.shm_radix_bootstrap import (create_shm_radix_regions,
+                                                   shm_name_for)
+
+    shm_radix_id = f"swaplanner{os.getpid()}"
+    saved = {name: getattr(GLOBAL_CONFIG_FROM_ENV, name)
+             for name in ("radix_shmem", "shm_radix_id", "radix_world_size")}
+    GLOBAL_CONFIG_FROM_ENV.radix_shmem = True
+    GLOBAL_CONFIG_FROM_ENV.shm_radix_id = shm_radix_id
+    GLOBAL_CONFIG_FROM_ENV.radix_world_size = 1
+
+    def _sweep() -> None:
+        # Regions land on hugepages when the host has them; sweep both backings.
+        name = shm_name_for(DeviceType.CPU, shm_radix_id)
+        for root in ("/dev/shm", "/dev/hugepages"):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(f"{root}{name}")
+
+    _sweep()
+    owners = None
+    try:
+        cache_config = CacheConfig(
+            tokens_per_block=TOKENS_PER_BLOCK,
+            enable_cpu=True, enable_ssd=False, enable_remote=False,
+            num_cpu_blocks=num_blocks,
+        )
+        cache_config.swa = SWAPoolConfig(enabled=True, num_slots=swa_slots,
+                                         num_swa_layers=1,
+                                         bytes_per_token_per_layer=64)
+        cache_config.enable_swa_transfer = True
+        model_config = ModelConfig(num_layers=2, num_kv_heads=4, head_size=64,
+                                   dtype=torch.float16, use_mla=False,
+                                   tp_size=1, dp_size=1)
+        # Hold the owner handle until teardown: dropping it unlinks the region.
+        owners = create_shm_radix_regions(cache_config,
+                                          shm_radix_id=shm_radix_id)
+        engine = GlobalCacheEngine(cache_config, model_config)
+        assert engine.use_radix_shmem
+        assert engine.swa_op_constructor.enabled, \
+            "SWA gate should be on: enable_swa_transfer + radixshmem swa_enabled"
+        yield engine
+    finally:
+        del owners
+        _sweep()
+        for name, value in saved.items():
+            setattr(GLOBAL_CONFIG_FROM_ENV, name, value)
+
+
+def _ops_by_type(graph):
+    ops = {}
+    for op in graph._op_map.values():
+        ops.setdefault(op.transfer_type, []).append(op)
+    return ops
+
+
+def _split_swa(ops_of_type):
+    full = [op for op in ops_of_type if not getattr(op, "is_swa", False)]
+    swa = [op for op in ops_of_type if getattr(op, "is_swa", False)]
+    return full, swa
+
+
+def _real_seq(token_ids):
+    from flexkv.common.block import SequenceMeta
+    return SequenceMeta(token_ids=np.asarray(token_ids).copy(),
+                        tokens_per_block=TOKENS_PER_BLOCK)
+
+
+def test_put_then_get_swa_roundtrip_on_real_region():
+    """§5 tests 2 + 3, end to end at the control plane.
+
+    PUT: the graph carries a 20-block Full D2H plus an 8-slot is_swa D2H, both
+    on the task-end barrier; before the completion callback a joint query sees
+    nothing; the callback publishes insert(FULL) then insert(SWA) and releases
+    the query. GET(swa_aware): one graph with a 20-block Full H2D plus the
+    8-slot SWA H2D, both on the barrier; the query pin lives until the callback
+    and is gone after it.
+    """
+    with _swa_global_engine() as engine:
+        cpu = engine.cpu_cache_engine
+        num_total = SWA_ENV_BLOCKS
+
+        # Record the publish order without breaking the real inserts.
+        published = []
+        real_insert = cpu.insert
+
+        def _recording_insert(*args, **kwargs):
+            published.append(kwargs.get("component"))
+            return real_insert(*args, **kwargs)
+
+        cpu.insert = _recording_insert              # type: ignore[method-assign]
+
+        token_ids, token_mask, slot_mapping = _fake_request(20)
+        graph, put_mask, put_cb, _op_cbs, put_end = engine.put(
+            request_id=7, token_ids=token_ids, token_mask=token_mask,
+            slot_mapping=slot_mapping, dp_client_id=0)
+
+        full_d2h, swa_d2h = _split_swa(_ops_by_type(graph)[TransferType.D2H])
+        assert len(full_d2h) == 1 and len(swa_d2h) == 1
+        assert full_d2h[0].dst_block_ids.size == 20
+        # k GPU-side placeholders, late-bound from swa_slot_mapping at launch.
+        assert swa_d2h[0].src_block_ids.size == SWA_W
+        assert swa_d2h[0].dst_block_ids.size == SWA_W
+        # The request's GPU blocks are free only when BOTH drains are done.
+        put_end_preds = set(graph._op_map[put_end].predecessors)
+        assert {full_d2h[0].op_id, swa_d2h[0].op_id} <= put_end_preds
+        assert bool(put_mask.all())
+
+        # §5 test 2, first half: nothing is queryable before completion --
+        # a joint match reaches neither the Full path nor the window.
+        pending = cpu.match(_real_seq(token_ids), with_peer=False,
+                            component_mask=JOINT_MASK)
+        assert pending.num_matched_blocks == 0
+        pending.release()
+
+        put_cb()                                    # graph completion
+        # §3.3 PUT step 5: insert(FULL) strictly before insert(SWA).
+        assert published == [shmradix.ComponentType.FULL, _SWA]
+
+        after = cpu.match(_real_seq(token_ids), with_peer=False,
+                          component_mask=JOINT_MASK)
+        assert after.num_matched_blocks == 20
+        assert after.swa_start == 12
+        assert len(after.swa_slots) == SWA_W
+        after.release()
+
+        # GET, SWA-aware: one graph, Full H2D + SWA H2D.
+        graph, get_mask, get_cb, _op_cbs, get_end = engine.get(
+            request_id=8, token_ids=token_ids, token_mask=token_mask,
+            slot_mapping=slot_mapping, dp_client_id=0, swa_aware=True)
+        assert int(get_mask.sum()) == 20 * TOKENS_PER_BLOCK
+
+        full_h2d, swa_h2d = _split_swa(_ops_by_type(graph)[TransferType.H2D])
+        assert len(full_h2d) == 1 and len(swa_h2d) == 1
+        assert full_h2d[0].src_block_ids.size == 20
+        # Slot IDENTITY, not just shape: the H2D must read exactly the SWA-pool
+        # slots the joint query returned -- Full-pool ids of the same size would
+        # pass a size check and read the wrong pool.
+        assert swa_h2d[0].src_block_ids.tolist() == after.swa_slots.tolist()
+        get_end_preds = set(graph._op_map[get_end].predecessors)
+        assert {full_h2d[0].op_id, swa_h2d[0].op_id} <= get_end_preds
+
+        # §5 test 3: the query pin is held for the whole graph -- the 20 hit
+        # blocks are un-evictable, so a full-pool take comes up short...
+        held = cpu.take(num_total, strict=False)
+        assert len(held) == num_total - 20
+        cpu.recycle(held)
+
+        get_cb()                                    # Full H2D + SWA H2D done
+        # ...and after the completion callback the pin is gone: every block in
+        # the pool can be taken (evicting the published prefix).
+        drained = cpu.take(num_total, strict=False)
+        assert len(drained) == num_total
+        cpu.recycle(drained)
+
+
+def test_put_degrades_to_full_only_when_the_swa_pool_is_exhausted():
+    """§3.3 PUT step 3: an empty all-or-none SWA take drops the SWA leg -- no
+    is_swa op, no SWA staged insert -- and the Full plan proceeds untouched."""
+    with _swa_global_engine(swa_slots=SWA_W) as engine:  # exactly one window
+        cpu = engine.cpu_cache_engine
+
+        # Sequence A owns the only window...
+        tok_a, mask_a, sm_a = _fake_request(10)
+        _graph, _mask, put_cb_a, _cbs, _end = engine.put(
+            request_id=11, token_ids=tok_a, token_mask=mask_a,
+            slot_mapping=sm_a, dp_client_id=0)
+        put_cb_a()
+        # ...and a live joint match pins it against eviction.
+        pin = cpu.match(_real_seq(tok_a), with_peer=False,
+                        component_mask=JOINT_MASK)
+        assert len(pin.swa_slots) == SWA_W
+
+        # Sequence B's PUT cannot reserve a window: Full-only plan.
+        tok_b, mask_b, sm_b = _fake_request(10, base=1_000_000)
+        graph, put_mask, put_cb_b, _cbs, _end = engine.put(
+            request_id=12, token_ids=tok_b, token_mask=mask_b,
+            slot_mapping=sm_b, dp_client_id=0)
+        full_d2h, swa_d2h = _split_swa(_ops_by_type(graph)[TransferType.D2H])
+        assert len(full_d2h) == 1 and swa_d2h == []
+        assert bool(put_mask.all())
+        put_cb_b()
+        pin.release()
+
+        # B's Full path is served (Full-only), and a joint query still finds
+        # nothing for B -- its window was never stored.
+        full_only = cpu.match(_real_seq(tok_b), with_peer=False)
+        assert full_only.num_matched_blocks == 10
+        full_only.release()
+        joint = cpu.match(_real_seq(tok_b), with_peer=False,
+                          component_mask=JOINT_MASK)
+        assert joint.num_matched_blocks == 0
+        joint.release()
+
+
+def test_get_without_swa_aware_stays_full_only_on_swa_region():
+    """A plain GET on an SWA-carrying region keeps the Full-only shape: mask
+    FULL, no is_swa ops -- `swa_aware` is the request-side opt-in."""
+    with _swa_global_engine() as engine:
+        token_ids, token_mask, slot_mapping = _fake_request(12)
+        _graph, _mask, put_cb, _cbs, _end = engine.put(
+            request_id=21, token_ids=token_ids, token_mask=token_mask,
+            slot_mapping=slot_mapping, dp_client_id=0)
+        put_cb()
+
+        graph, get_mask, get_cb, _cbs, _end = engine.get(
+            request_id=22, token_ids=token_ids, token_mask=token_mask,
+            slot_mapping=slot_mapping, dp_client_id=0)
+        assert int(get_mask.sum()) == 12 * TOKENS_PER_BLOCK
+        full_h2d, swa_h2d = _split_swa(_ops_by_type(graph)[TransferType.H2D])
+        assert len(full_h2d) == 1 and swa_h2d == []
+        get_cb()
+
+
+def _drive_put(engine, token_ids, token_mask, slot_mapping, request_id):
+    """put() + immediate completion; returns (graph, return_mask)."""
+    graph, return_mask, cb, _op_cbs, _end = engine.put(
+        request_id=request_id, token_ids=token_ids, token_mask=token_mask,
+        slot_mapping=slot_mapping, dp_client_id=0)
+    cb()
+    return graph, return_mask
+
+
+def test_reput_of_a_fully_cached_prefix_is_an_early_return():
+    """A PUT whose Full prefix is fully cached builds no ops -- including no
+    SWA republish (a lost window stays lost; accepted MVP limitation)."""
+    with _swa_global_engine() as engine:
+        tok, mask, sm = _fake_request(10)
+        _drive_put(engine, tok, mask, sm, request_id=41)
+        graph, return_mask = _drive_put(engine, tok, mask, sm, request_id=42)
+        assert _ops_by_type(graph) == {}
+        assert not bool(return_mask.any())
+
+
+def test_put_extension_releases_a_nonempty_match_pin_after_both_publishes():
+    """A PUT extending a cached prefix pins the matched head; the pin must be
+    released only via the SWA staged insert's hold at graph completion. Exact
+    take() counts on the 64-block pool make a leaked (or double-held) pin
+    visible: 10 pinned + 10 staged before the callback, everything evictable
+    after."""
+    with _swa_global_engine() as engine:
+        cpu = engine.cpu_cache_engine
+        tok10, mask10, sm10 = _fake_request(10)
+        _drive_put(engine, tok10, mask10, sm10, request_id=51)
+
+        tok20, mask20, sm20 = _fake_request(20)     # same first 10 blocks
+        graph, return_mask, cb, _op_cbs, _end = engine.put(
+            request_id=52, token_ids=tok20, token_mask=mask20,
+            slot_mapping=sm20, dp_client_id=0)
+        full_d2h, swa_d2h = _split_swa(_ops_by_type(graph)[TransferType.D2H])
+        assert full_d2h[0].dst_block_ids.size == 10  # only the extension moves
+        assert len(swa_d2h) == 1                     # window rides along
+        # 10 matched blocks pinned by the PUT's query + 10 staged slots taken:
+        # only 44 of 64 can be taken while the graph is in flight.
+        held = cpu.take(SWA_ENV_BLOCKS, strict=False)
+        assert len(held) == SWA_ENV_BLOCKS - 20
+        cpu.recycle(held)
+
+        cb()                                        # FULL publish, SWA publish, release
+        drained = cpu.take(SWA_ENV_BLOCKS, strict=False)
+        assert len(drained) == SWA_ENV_BLOCKS       # pin gone, all evictable
+        cpu.recycle(drained)
+
+
+def test_swa_get_of_a_shorter_prefix_misses():
+    """query_end caps the joint query at the REQUEST's end: the stored window
+    closes at block 20, so an SWA-aware GET of the first 12 blocks finds no
+    window ending inside its range and must miss entirely (no Full-only
+    fallback)."""
+    with _swa_global_engine() as engine:
+        tok, mask, sm = _fake_request(20)
+        _drive_put(engine, tok, mask, sm, request_id=61)
+
+        short = 12 * TOKENS_PER_BLOCK
+        graph, get_mask, get_cb, _op_cbs, _end = engine.get(
+            request_id=62, token_ids=tok[:short], token_mask=mask[:short],
+            slot_mapping=sm[:short], dp_client_id=0, swa_aware=True)
+        assert int(get_mask.sum()) == 0
+        assert _ops_by_type(graph) == {}
+        get_cb()
+
+        # The same shorter request WITHOUT swa_aware full-hits: the miss above
+        # is the joint (window) constraint, not a Full one.
+        graph, get_mask, get_cb, _op_cbs, _end = engine.get(
+            request_id=63, token_ids=tok[:short], token_mask=mask[:short],
+            slot_mapping=sm[:short], dp_client_id=0)
+        assert int(get_mask.sum()) == short
+        get_cb()
+
+
+def test_short_path_put_and_get_use_k_smaller_than_w():
+    """k = min(block_mask_end, W) at the planner: a 5-block PUT reserves and
+    drains a 5-slot window (swa_start=0), and the SWA-aware GET restores it."""
+    with _swa_global_engine() as engine:
+        cpu = engine.cpu_cache_engine
+        tok, mask, sm = _fake_request(5)
+        graph, _ = _drive_put(engine, tok, mask, sm, request_id=71)
+        _full_d2h, swa_d2h = _split_swa(_ops_by_type(graph)[TransferType.D2H])
+        assert swa_d2h[0].src_block_ids.size == 5
+
+        joint = cpu.match(_real_seq(tok), with_peer=False,
+                          component_mask=JOINT_MASK)
+        assert (joint.num_matched_blocks, joint.swa_start,
+                len(joint.swa_slots)) == (5, 0, 5)
+        joint.release()
+
+        graph, get_mask, get_cb, _op_cbs, _end = engine.get(
+            request_id=72, token_ids=tok, token_mask=mask,
+            slot_mapping=sm, dp_client_id=0, swa_aware=True)
+        assert int(get_mask.sum()) == 5 * TOKENS_PER_BLOCK
+        _full_h2d, swa_h2d = _split_swa(_ops_by_type(graph)[TransferType.H2D])
+        assert swa_h2d[0].src_block_ids.size == 5
+        get_cb()
 
 
 # =============================================================================
