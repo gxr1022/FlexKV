@@ -309,7 +309,7 @@ def _tp_client_proc(server_recv_port, model_config, cache_config,
         tokens_per_block=cache_config.tokens_per_block,
         num_head=model_config.num_kv_heads // model_config.tp_size,
         head_size=model_config.head_size,
-        is_mla=model_config.use_mla,
+        kv_dim=model_config.kv_dim,
     )
     gpu_blocks = [
         torch.zeros(size=tuple(gpu_layout.kv_shape[1:]),
@@ -376,7 +376,7 @@ def _node_proc(rank, gpu_id, run_id, registry, cluster_id, rdma_dev,
     tag = f"[node r{rank}]"
     model_config = ModelConfig(
         num_layers=2, num_kv_heads=4, head_size=128,
-        dtype=torch.float16, use_mla=False, tp_size=1, dp_size=1,
+        dtype=torch.float16, tp_size=1, dp_size=1,
     )
     cache_config = CacheConfig(
         tokens_per_block=TOKENS_PER_BLOCK,

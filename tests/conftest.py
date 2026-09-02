@@ -89,7 +89,7 @@ def radix_shmem_env(request):
     GLOBAL_CONFIG_FROM_ENV.radix_world_size = 1
 
     model_config = ModelConfig(num_layers=2, num_kv_heads=4, head_size=64,
-                               dtype=torch.float16, use_mla=False,
+                               dtype=torch.float16,
                                tp_size=1, dp_size=1)
     shutil.rmtree(ssd_dir, ignore_errors=True)
     os.makedirs(ssd_dir, exist_ok=True)
