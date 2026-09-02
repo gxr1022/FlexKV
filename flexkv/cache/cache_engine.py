@@ -41,8 +41,7 @@ from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
 from flexkv.cache.swa_cache_engine import SWAOpConstructor
 from flexkv.common.block import SequenceMeta, format_block_hash
 from flexkv.common.config import (CacheConfig, ModelConfig,
-                                  GLOBAL_CONFIG_FROM_ENV, SWAPoolConfig,
-                                  RADIX_SWA_WINDOW_BLOCKS)
+                                  GLOBAL_CONFIG_FROM_ENV, SWAPoolConfig)
 from flexkv.common.transfer import (
     CompletedOp,
     CompletionAwareCallback,
@@ -3202,7 +3201,7 @@ class GlobalCacheEngine:
 
         swa_new: Optional[np.ndarray] = None
         if self.swa_op_constructor.enabled:
-            k = min(block_mask_end, RADIX_SWA_WINDOW_BLOCKS)
+            k = min(block_mask_end, self.cache_config.swa.window_blocks)
             swa_take = self.cpu_cache_engine.take(num_required_blocks=k,
                                                   strict=False,
                                                   component=COMPONENT_SWA)

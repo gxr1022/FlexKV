@@ -291,7 +291,7 @@ _SWA = shmradix.ComponentType.SWA
 
 
 def _make_swa_engine(name: str, blocks: int = 2000, swa_slots: int = 64,
-                     tokens_per_block: int = 16):
+                     tokens_per_block: int = 16, window_blocks: int = SWA_W):
     """A single region carrying the SWA component, and an engine that knows it.
 
     Regions land on hugepages when the host has them, so stale-state sweeping
@@ -307,7 +307,7 @@ def _make_swa_engine(name: str, blocks: int = 2000, swa_slots: int = 64,
         max_blocks=blocks,
         block_size=tokens_per_block,
         component_mask=JOINT_MASK,
-        swa_window_blocks=SWA_W,
+        swa_window_blocks=window_blocks,
         swa_max_blocks=swa_slots,
     )
     server = shmradix.RadixServer(name, cfg)
@@ -316,7 +316,8 @@ def _make_swa_engine(name: str, blocks: int = 2000, swa_slots: int = 64,
         num_total_blocks=blocks,
         tokens_per_block=tokens_per_block,
         shm_name=name,
-        swa_config=SWAPoolConfig(enabled=True, num_slots=swa_slots),
+        swa_config=SWAPoolConfig(enabled=True, num_slots=swa_slots,
+                                 window_blocks=window_blocks),
     )
     return engine, server
 
@@ -327,8 +328,9 @@ def _publish_full(engine, seq, num_blocks: int) -> np.ndarray:
     return slots
 
 
-def _publish_swa(engine, seq, path_end: int) -> np.ndarray:
-    k = min(path_end, SWA_W)
+def _publish_swa(engine, seq, path_end: int,
+                 window_blocks: int = SWA_W) -> np.ndarray:
+    k = min(path_end, window_blocks)
     slots = engine.take(k, strict=False, component=_SWA)
     assert len(slots) == k, "SWA pool unexpectedly short in test setup"
     engine.insert(seq, slots, num_insert_blocks=path_end, component=_SWA)
@@ -416,6 +418,22 @@ def test_swa_insert_without_full_path_is_benign_and_recycles():
     again = engine.take(SWA_W, strict=False, component=_SWA)
     assert len(again) == SWA_W                      # auto-recycled, none leaked
     engine.recycle(again, component=_SWA)
+
+
+def test_swa_window_blocks_one_stores_a_single_slot_window():
+    """W comes from the region's config, not a constant: window_blocks=1 (the
+    SGLang DSv4 shape, window inside one page) publishes one-slot windows."""
+    engine, _server = _make_swa_engine("/cers_swa_w1", window_blocks=1)
+    seq = FakeSeq(block_hashes=_hashes(45, 20), tokens_per_block=16)
+
+    _publish_full(engine, seq, 20)
+    _publish_swa(engine, seq, path_end=20, window_blocks=1)
+
+    match = engine.match(seq, with_peer=False, component_mask=JOINT_MASK)
+    assert match.num_matched_blocks == 20
+    assert match.swa_start == 19                    # max(0, 20 - 1)
+    assert len(match.swa_slots) == 1
+    match.release()
 
 
 # =============================================================================
@@ -976,7 +994,8 @@ SWA_ENV_BLOCKS = 64
 
 @contextlib.contextmanager
 def _swa_global_engine(swa_slots: int = 2 * SWA_W,
-                       num_blocks: int = SWA_ENV_BLOCKS):
+                       num_blocks: int = SWA_ENV_BLOCKS,
+                       window_blocks: int = SWA_W):
     """A real `GlobalCacheEngine` on a real CPU region with the SWA component.
 
     Mirrors conftest's `radix_shmem_env` (which is Full-only and module-scoped)
@@ -1020,7 +1039,8 @@ def _swa_global_engine(swa_slots: int = 2 * SWA_W,
         )
         cache_config.swa = SWAPoolConfig(enabled=True, num_slots=swa_slots,
                                          num_swa_layers=1,
-                                         bytes_per_token_per_layer=64)
+                                         bytes_per_token_per_layer=64,
+                                         window_blocks=window_blocks)
         cache_config.enable_swa_transfer = True
         model_config = ModelConfig(num_layers=2, num_kv_heads=4, head_size=64,
                                    dtype=torch.float16, use_mla=False,
@@ -1303,6 +1323,31 @@ def test_short_path_put_and_get_use_k_smaller_than_w():
         assert int(get_mask.sum()) == 5 * TOKENS_PER_BLOCK
         _full_h2d, swa_h2d = _split_swa(_ops_by_type(graph)[TransferType.H2D])
         assert swa_h2d[0].src_block_ids.size == 5
+        get_cb()
+
+
+def test_planner_uses_configured_window_blocks():
+    """PUT reserves k=min(blocks, cache_config.swa.window_blocks), not a
+    constant: a window_blocks=1 engine builds 1-slot SWA ops end to end."""
+    with _swa_global_engine(window_blocks=1) as engine:
+        cpu = engine.cpu_cache_engine
+        tok, mask, sm = _fake_request(10)
+        graph, _ = _drive_put(engine, tok, mask, sm, request_id=81)
+        _full_d2h, swa_d2h = _split_swa(_ops_by_type(graph)[TransferType.D2H])
+        assert swa_d2h[0].src_block_ids.size == 1
+
+        joint = cpu.match(_real_seq(tok), with_peer=False,
+                          component_mask=JOINT_MASK)
+        assert (joint.num_matched_blocks, joint.swa_start,
+                len(joint.swa_slots)) == (10, 9, 1)
+        joint.release()
+
+        graph, get_mask, get_cb, _op_cbs, _end = engine.get(
+            request_id=82, token_ids=tok, token_mask=mask,
+            slot_mapping=sm, dp_client_id=0, swa_aware=True)
+        assert int(get_mask.sum()) == 10 * TOKENS_PER_BLOCK
+        _full_h2d, swa_h2d = _split_swa(_ops_by_type(graph)[TransferType.H2D])
+        assert swa_h2d[0].src_block_ids.size == 1
         get_cb()
 
 

@@ -37,8 +37,7 @@ import struct
 import time
 from typing import Dict, Generator, Optional, Tuple
 
-from flexkv.common.config import (GLOBAL_CONFIG_FROM_ENV, CacheConfig,
-                                  RADIX_SWA_WINDOW_BLOCKS)
+from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV, CacheConfig
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.transfer import DeviceType
 
@@ -259,18 +258,23 @@ def create_shm_radix_regions(cache_config: CacheConfig,
         tier_swa = (cache_config.swa.for_cache_tier(dt)
                     if cache_config.swa is not None else None)
         if dt == DeviceType.CPU and tier_swa is not None and tier_swa.num_slots > 0:
-            if tier_swa.num_slots < RADIX_SWA_WINDOW_BLOCKS:
+            if tier_swa.window_blocks < 1:
+                raise ValueError(
+                    f"cache_config.swa.window_blocks={tier_swa.window_blocks} "
+                    f"must be >= 1"
+                )
+            if tier_swa.num_slots < tier_swa.window_blocks:
                 # All-or-none window allocation: a pool smaller than one
                 # window can never store anything, so fail at startup.
                 raise ValueError(
                     f"cache_config.swa.num_slots={tier_swa.num_slots} cannot "
-                    f"hold one {RADIX_SWA_WINDOW_BLOCKS}-block SWA window; "
+                    f"hold one {tier_swa.window_blocks}-block SWA window; "
                     f"raise num_slots or disable SWA"
                 )
             component_kwargs = dict(
                 component_mask=(shmradix.COMPONENT_MASK_FULL |
                                 shmradix.COMPONENT_MASK_SWA),
-                swa_window_blocks=RADIX_SWA_WINDOW_BLOCKS,
+                swa_window_blocks=tier_swa.window_blocks,
                 swa_max_blocks=tier_swa.num_slots,
             )
         cfg = shmradix.ShmConfig(

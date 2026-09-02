@@ -668,6 +668,9 @@ class FlexKVConfig:
                     enabled=True,
                     num_swa_layers=self.model_config.num_layers,
                     bytes_per_token_per_layer=swa_bytes_per_token,
+                    # DSv4's 128-token window fits inside one 256-token page,
+                    # so a window is a single slot (radixshmem W=1).
+                    window_blocks=1,
                 )
             # Gate the SWA data plane (byte movement) behind an env switch so it
             # can be turned off for A/B or if a byte-layout issue surfaces in
