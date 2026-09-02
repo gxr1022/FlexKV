@@ -171,7 +171,8 @@ class GetTransferPlan:
     # same completion work as on_complete closures and leave these empty.
     node_to_unlock: Dict[DeviceType, Tuple[object, int]] = field(default_factory=dict)
     buffer_to_free: Dict[DeviceType, np.ndarray] = field(default_factory=dict)
-    # Deferred actions run once the transfer graph completes.
+    # Deferred actions run once the transfer graph completes: node unlock /
+    # set_ready / publish, buffer recycle, and radixshmem source-ref release.
     on_complete: List[Callable[[], None]] = field(default_factory=list)
 
     @classmethod
@@ -199,7 +200,8 @@ class PutTransferPlan:
     # same completion work as on_complete closures and leave these empty.
     node_to_unlock: Dict[DeviceType, Tuple[object, int]] = field(default_factory=dict)
     buffer_to_free: Dict[DeviceType, np.ndarray] = field(default_factory=dict)
-    # Deferred actions run once the transfer graph completes.
+    # Deferred actions run once the transfer graph completes: node unlock /
+    # set_ready / publish, buffer recycle, and radixshmem source-ref release.
     on_complete: List[Callable[[], None]] = field(default_factory=list)
 
     @classmethod
@@ -1496,8 +1498,6 @@ class GlobalCacheEngine:
             cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all_accel(sequence_meta)
         else:
             cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all(sequence_meta)
-        match_finalizers = self._collect_finalizers(
-            cpu_matched_result, ssd_matched_result, remote_matched_result)
         transfer_graph = TransferOpGraph()
         swa_reservation: Optional[SWAReadReservation] = None
         swa_read_source: SWAReadSource = SWAReadSource()
@@ -1547,9 +1547,6 @@ class GlobalCacheEngine:
                 total_query_blocks = block_mask_end - block_mask_start
                 if total_query_blocks > 0:
                     self._metrics_collector.record_cache_miss(total_query_blocks)
-            # No transfer will consume the matched prefix; release its ref now.
-            for fn in match_finalizers or []:
-                fn()
             return self._empty_get_return(request_id)
         assert fragment123_num_blocks <= len(gpu_block_ids)
 
@@ -1589,9 +1586,6 @@ class GlobalCacheEngine:
                 self._release_swa_read_reservation(swa_reservation)
                 if self._metrics_collector is not None:
                     self._metrics_collector.record_allocation_failure("global")
-                # No transfer will consume the matched prefix; release its ref now.
-                for fn in match_finalizers or []:
-                    fn()
                 return self._empty_get_return(request_id)
             if len(fragment23_cpu_blocks) < num_extra_required_blocks:
                 self.cpu_cache_engine.recycle(fragment23_cpu_blocks)
@@ -1599,9 +1593,6 @@ class GlobalCacheEngine:
                 # Record allocation failure (resource unavailable, not cache miss)
                 if self._metrics_collector is not None:
                     self._metrics_collector.record_allocation_failure("global")
-                # No transfer will consume the matched prefix; release its ref now.
-                for fn in match_finalizers or []:
-                    fn()
                 return self._empty_get_return(request_id)
             fragment123_cpu_blocks = np.concatenate([fragment123_cpu_blocks, fragment23_cpu_blocks])
             # Mooncake can partially fail after match. Keep its staging blocks
@@ -1764,21 +1755,21 @@ class GlobalCacheEngine:
                 transfer_graph.add_dependency(op_h2d.op_id, op_remote2h.op_id)
             finished_ops_ids.append(op_h2d.op_id)
 
-        on_complete: List[Callable[[], None]] = []
+        node_to_unlock = {}
         if cpu_node_to_unlock is not None:
-            on_complete.append(self._defer_node_release(DeviceType.CPU,
-                                     cpu_node_to_unlock, cpu_node_to_unlock.size(), is_put=False))
+            node_to_unlock[DeviceType.CPU] = (
+                cpu_node_to_unlock,
+                0 if defer_mooncake_commit else cpu_node_to_unlock.size(),
+            )
         if ssd_node_to_unlock is not None:
-            on_complete.append(self._defer_node_release(DeviceType.SSD,
-                                     ssd_node_to_unlock, ssd_node_to_unlock.size(), is_put=False))
+            node_to_unlock[DeviceType.SSD] = (
+                ssd_node_to_unlock,
+                0 if defer_mooncake_commit else ssd_node_to_unlock.size(),
+            )
         if remote_node_to_unlock is not None:
-            on_complete.append(self._defer_node_release(DeviceType.REMOTE,
-                                     remote_node_to_unlock, remote_node_to_unlock.size(), is_put=False))
-        recycle = self._defer_recycle(DeviceType.CPU, cpu_blocks_to_free)
-        if recycle is not None:
-            on_complete.append(recycle)
-        on_complete.extend(match_finalizers)
+            node_to_unlock[DeviceType.REMOTE] = (remote_node_to_unlock, remote_node_to_unlock.size())
 
+        buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
         num_gpu_blocks_to_transfer = len(fragment123_gpu_blocks) if enable_gpu else 0
         deferred_inserts: List[DeferredCacheInsert] = []
 
@@ -1879,9 +1870,12 @@ class GlobalCacheEngine:
         return GetTransferPlan(
             transfer_graph=transfer_graph,
             finished_ops_ids=finished_ops_ids,
+            node_to_unlock=node_to_unlock,
             op_callback_dict=op_callback_dict,
+            buffer_to_free=buffer_to_free,
             num_gpu_blocks_to_transfer=num_gpu_blocks_to_transfer,
-            on_complete=on_complete,
+            deferred_inserts=deferred_inserts,
+            swa_reservation=swa_reservation,
         )
 
     def _get_impl_local(self,
@@ -1917,7 +1911,6 @@ class GlobalCacheEngine:
                 sequence_meta, temp_cache_strategy, is_put=False, gpu_matched_blocks=block_mask_start)
         else:
             cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta, temp_cache_strategy)
-        match_finalizers = self._collect_finalizers(cpu_matched_result, ssd_matched_result)
 
         transfer_graph = TransferOpGraph()
         swa_reservation: Optional[SWAReadReservation] = None
@@ -1980,9 +1973,6 @@ class GlobalCacheEngine:
                 if total_query_blocks > 0:
                     self._metrics_collector.record_cache_miss(total_query_blocks)
             nvtx.end_range(nvtx_range)
-            # No transfer will consume the matched prefix; release its ref now.
-            for fn in match_finalizers or []:
-                fn()
             return self._empty_get_return(request_id)
         assert fragment12_num_blocks <= len(gpu_block_ids)
 
@@ -2029,9 +2019,6 @@ class GlobalCacheEngine:
             if self._metrics_collector is not None:
                 self._metrics_collector.record_allocation_failure("local")
             nvtx.end_range(nvtx_range)
-            # No transfer will consume the matched prefix; release its ref now.
-            for fn in match_finalizers or []:
-                fn()
             return self._empty_get_return(request_id)
 
         # Record cache hit/miss metrics after confirming successful allocation
@@ -2067,11 +2054,7 @@ class GlobalCacheEngine:
                 cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
                                                                   fragment1_cpu_blocks_local,
                                                                   is_ready=False)
-                # insert() returns None when nothing was attached (suffix already
-                # in the shared tree) — no unready node to flip ready.
-                if cpu_node_to_unlock is not None:
-                    op_node_to_ready[op_peerh2h.op_id] = (
-                        DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
+                op_node_to_ready[op_peerh2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
             else:
                 cpu_blocks_to_free = np.concatenate([cpu_blocks_to_free, fragment1_cpu_blocks_local])
 
@@ -2087,10 +2070,9 @@ class GlobalCacheEngine:
                 )
                 transfer_graph.add_transfer_op(op_gds_transfer)
                 finished_ops_ids.append(op_gds_transfer.op_id)
-                if ssd_node_to_unlock is not None:
-                    op_node_to_ready[op_gds_transfer.op_id] = (DeviceType.SSD,
-                                                               ssd_node_to_unlock,
-                                                               ssd_node_to_unlock.size())
+                op_node_to_ready[op_gds_transfer.op_id] = (DeviceType.SSD,
+                                                           ssd_node_to_unlock,
+                                                           ssd_node_to_unlock.size())
             else:
                 fragment2_cpu_blocks = allocated_cpu_blocks[:fragment2_num_blocks]
 
@@ -2121,9 +2103,7 @@ class GlobalCacheEngine:
                                                                         block_mask_start,
                                                                     is_ready=False,
                                                                     match_result=cpu_matched_result)
-                    if cpu_node_to_unlock is not None:
-                        op_node_to_ready[op_disk2h.op_id] = (
-                            DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
+                    op_node_to_ready[op_disk2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
                 else:
                     cpu_blocks_to_free = np.concatenate([cpu_blocks_to_free, fragment2_cpu_blocks])
         if self.cache_config.enable_p2p_cpu and cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
@@ -2150,17 +2130,12 @@ class GlobalCacheEngine:
                 transfer_graph.add_dependency(op_h2d.op_id, op_peerh2h.op_id)
             finished_ops_ids.append(op_h2d.op_id)
 
-        on_complete: List[Callable[[], None]] = []
+        node_to_unlock = {}
         if cpu_node_to_unlock is not None:
-            on_complete.append(self._defer_node_release(DeviceType.CPU,
-                                     cpu_node_to_unlock, cpu_node_to_unlock.size(), is_put=False))
+            node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
         if ssd_node_to_unlock is not None:
-            on_complete.append(self._defer_node_release(DeviceType.SSD,
-                                     ssd_node_to_unlock, ssd_node_to_unlock.size(), is_put=False))
-        recycle = self._defer_recycle(DeviceType.CPU, cpu_blocks_to_free)
-        if recycle is not None:
-            on_complete.append(recycle)
-        on_complete.extend(match_finalizers)
+            node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
+        buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
         num_gpu_blocks_to_transfer = len(fragment12_gpu_blocks) if enable_gpu else 0
         op_callback_dict = self._build_op_callback_dict(op_node_to_ready)
 
@@ -2177,9 +2152,11 @@ class GlobalCacheEngine:
         return GetTransferPlan(
             transfer_graph=transfer_graph,
             finished_ops_ids=finished_ops_ids,
+            node_to_unlock=node_to_unlock,
             op_callback_dict=op_callback_dict,
+            buffer_to_free=buffer_to_free,
             num_gpu_blocks_to_transfer=num_gpu_blocks_to_transfer,
-            on_complete=on_complete,
+            swa_reservation=swa_reservation,
         )
 
     def _match_radixshmem(self,
@@ -2532,8 +2509,24 @@ class GlobalCacheEngine:
         else:
             cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all(sequence_meta,
                                                                                            temp_cache_strategy=temp_cache_strategy)
-        match_finalizers = self._collect_finalizers(
-            cpu_matched_result, ssd_matched_result, remote_matched_result)
+        defer_put_commit = self.use_mooncake_store_backend
+        if defer_put_commit:
+            # PUT sources must be addresses in this process's registered host
+            # buffers. A hierarchical match may select a peer node, which is a
+            # valid GET source but cannot back local H2DISK/H2REMOTE writes.
+            match_cpu_local = getattr(self.cpu_cache_engine, "match_local", None)
+            if callable(match_cpu_local):
+                cpu_matched_result = match_cpu_local(sequence_meta)
+            if enable_ssd:
+                match_ssd_local = getattr(self.ssd_cache_engine, "match_local", None)
+                if callable(match_ssd_local):
+                    ssd_matched_result = match_ssd_local(sequence_meta)
+        cpu_matched_count = (
+            cpu_matched_result.num_ready_matched_blocks
+            if defer_put_commit else cpu_matched_result.num_matched_blocks)
+        ssd_matched_count = (
+            ssd_matched_result.num_ready_matched_blocks
+            if defer_put_commit else ssd_matched_result.num_matched_blocks)
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
             :cpu_matched_count][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
@@ -2543,10 +2536,7 @@ class GlobalCacheEngine:
 
         num_skipped_blocks = len(cpu_matched_blocks)
         fragment12_num_blocks = len(gpu_block_ids) - num_skipped_blocks
-        if fragment12_num_blocks == 0:
-            # No transfer will consume the matched prefix; release its ref now.
-            for fn in match_finalizers or []:
-                fn()
+        if fragment12_num_blocks == 0 and not defer_put_commit:
             return self._empty_put_return(request_id)
         fragment2_num_blocks = len(gpu_block_ids) - len(ssd_matched_blocks)
         if not enable_ssd:
@@ -2577,9 +2567,6 @@ class GlobalCacheEngine:
         )
         if len(fragment12_cpu_blocks) < fragment12_num_blocks:
             self.cpu_cache_engine.recycle(fragment12_cpu_blocks)
-            # No transfer will consume the matched prefix; release its ref now.
-            for fn in match_finalizers or []:
-                fn()
             return self._empty_put_return(request_id)
         put_to_ssd = False
         if enable_ssd and fragment2_num_blocks > 0:
@@ -2647,7 +2634,6 @@ class GlobalCacheEngine:
                     ssd_swa_slot=ssd_swa_slot,
                     remote_blocks=fragment3_remote_blocks if put_to_remote else None,
                     remote_swa_slot=remote_swa_slot,
-                    match_finalizers=match_finalizers,
                 )
 
         transfer_graph = TransferOpGraph()
@@ -2812,12 +2798,8 @@ class GlobalCacheEngine:
             is_ready=False,
             match_result=cpu_matched_result,
         )
-        # insert() returns None when nothing was attached (the whole suffix was
-        # already present in the shared tree) — then there is no unready node to
-        # flip ready after the transfer, so skip the ready-callback bookkeeping.
-        if cpu_node_to_unlock is not None:
-            op_node_to_ready[op_d2h.op_id] = (
-                DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
+        op_node_to_ready[op_d2h.op_id] = (
+            DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
         ssd_node_to_unlock = None
         if put_to_ssd:
             ssd_node_to_unlock = self.ssd_cache_engine.insert(
@@ -2826,9 +2808,9 @@ class GlobalCacheEngine:
                 is_ready=False,
                 match_result=ssd_matched_result,
             )
-            if ssd_node_to_unlock is not None:
-                op_node_to_ready[op_h2disk.op_id] = (
-                    DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
+            op_node_to_ready[op_h2disk.op_id] = (
+                DeviceType.SSD, ssd_node_to_unlock,
+                ssd_node_to_unlock.size())
         remote_node_to_unlock = None
         if put_to_remote:
             remote_node_to_unlock = self.remote_cache_engine.insert(
@@ -2837,23 +2819,21 @@ class GlobalCacheEngine:
                 is_ready=False,
                 match_result=remote_matched_result,
             )
-            if remote_node_to_unlock is not None:
-                op_node_to_ready[op_h2remote.op_id] = (
-                    DeviceType.REMOTE,
-                    remote_node_to_unlock,
-                    remote_node_to_unlock.size(),
-                )
-        on_complete: List[Callable[[], None]] = []
+            op_node_to_ready[op_h2remote.op_id] = (
+                DeviceType.REMOTE,
+                remote_node_to_unlock,
+                remote_node_to_unlock.size(),
+            )
+        node_to_unlock = {}
         if cpu_node_to_unlock is not None:
-            on_complete.append(self._defer_node_release(DeviceType.CPU,
-                                     cpu_node_to_unlock, cpu_node_to_unlock.size(), is_put=True))
+            node_to_unlock[DeviceType.CPU] = (
+                cpu_node_to_unlock, cpu_node_to_unlock.size())
         if ssd_node_to_unlock is not None:
-            on_complete.append(self._defer_node_release(DeviceType.SSD,
-                                     ssd_node_to_unlock, ssd_node_to_unlock.size(), is_put=True))
+            node_to_unlock[DeviceType.SSD] = (
+                ssd_node_to_unlock, ssd_node_to_unlock.size())
         if remote_node_to_unlock is not None:
-            on_complete.append(self._defer_node_release(DeviceType.REMOTE,
-                                     remote_node_to_unlock, remote_node_to_unlock.size(), is_put=True))
-        on_complete.extend(match_finalizers)
+            node_to_unlock[DeviceType.REMOTE] = (
+                remote_node_to_unlock, remote_node_to_unlock.size())
 
         op_callback_dict = self._build_op_callback_dict(op_node_to_ready)
         if cpu_swa_slot >= 0:
@@ -2886,10 +2866,12 @@ class GlobalCacheEngine:
         return PutTransferPlan(
             transfer_graph=transfer_graph,
             finished_ops_ids=finished_ops_ids,
+            node_to_unlock=node_to_unlock,
             op_callback_dict=op_callback_dict,
+            buffer_to_free={},
             num_gpu_blocks_to_transfer=len(fragment12_gpu_blocks),
             skipped_gpu_blocks=skipped_gpu_blocks,
-            on_complete=on_complete,
+            swa_slots_to_free=swa_slots_to_free,
         )
 
     def _put_impl_local(self,
@@ -2927,7 +2909,6 @@ class GlobalCacheEngine:
             cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta,
                                                                       temp_cache_strategy=temp_cache_strategy,
                                                                       is_put=True)
-        match_finalizers = self._collect_finalizers(cpu_matched_result, ssd_matched_result)
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
             :cpu_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
@@ -2941,9 +2922,6 @@ class GlobalCacheEngine:
         num_skipped_blocks = len(cpu_matched_blocks)
         fragment12_num_blocks = len(gpu_block_ids) - num_skipped_blocks
         if fragment12_num_blocks == 0:
-            # No transfer will consume the matched prefix; release its ref now.
-            for fn in match_finalizers or []:
-                fn()
             return self._empty_put_return(request_id)
         fragment2_num_blocks = len(gpu_block_ids) - len(ssd_matched_blocks)
         if not enable_ssd:
@@ -2974,9 +2952,6 @@ class GlobalCacheEngine:
             self.cpu_cache_engine.recycle(fragment12_cpu_blocks)
             if enable_ssd:
                 self.ssd_cache_engine.recycle(fragment2_ssd_blocks)
-            # No transfer will consume the matched prefix; release its ref now.
-            for fn in match_finalizers or []:
-                fn()
             return self._empty_put_return(request_id)
 
         cpu_swa_slot = -1
@@ -2997,7 +2972,6 @@ class GlobalCacheEngine:
                     cpu_swa_slot=cpu_swa_slot,
                     ssd_blocks=fragment2_ssd_blocks if enable_ssd else None,
                     ssd_swa_slot=ssd_swa_slot,
-                    match_finalizers=match_finalizers,
                 )
 
         transfer_graph = TransferOpGraph()
@@ -3069,10 +3043,7 @@ class GlobalCacheEngine:
             is_ready=False,
             match_result=cpu_matched_result,
         )
-        # insert() returns None when nothing was attached (suffix already in the
-        # shared tree) — no unready node to flip ready after the transfer.
-        if cpu_node_to_unlock is not None:
-            op_node_to_ready[op_d2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
+        op_node_to_ready[op_d2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
         ssd_node_to_unlock = None
         if len(fragment2_ssd_blocks) > 0:
             ssd_node_to_unlock = self.ssd_cache_engine.insert(
@@ -3081,16 +3052,12 @@ class GlobalCacheEngine:
                 is_ready=False,
                 match_result=ssd_matched_result,
             )
-            if ssd_node_to_unlock is not None:
-                op_node_to_ready[op_h2disk.op_id] = (DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
-        on_complete: List[Callable[[], None]] = []
+            op_node_to_ready[op_h2disk.op_id] = (DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
+        node_to_unlock = {}
         if cpu_node_to_unlock is not None:
-            on_complete.append(self._defer_node_release(DeviceType.CPU,
-                                     cpu_node_to_unlock, cpu_node_to_unlock.size(), is_put=True))
+            node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
         if ssd_node_to_unlock is not None:
-            on_complete.append(self._defer_node_release(DeviceType.SSD,
-                                     ssd_node_to_unlock, ssd_node_to_unlock.size(), is_put=True))
-        on_complete.extend(match_finalizers)
+            node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
 
         op_callback_dict = self._build_op_callback_dict(op_node_to_ready)
         if cpu_swa_slot >= 0:
@@ -3114,10 +3081,12 @@ class GlobalCacheEngine:
         return PutTransferPlan(
             transfer_graph=transfer_graph,
             finished_ops_ids=finished_ops_ids,
+            node_to_unlock=node_to_unlock,
             op_callback_dict=op_callback_dict,
+            buffer_to_free={},
             num_gpu_blocks_to_transfer=len(fragment12_gpu_blocks),
             skipped_gpu_blocks=skipped_gpu_blocks,
-            on_complete=on_complete,
+            swa_slots_to_free=swa_slots_to_free,
         )
 
     def _put_impl_radixshmem(self,
@@ -3297,44 +3266,6 @@ class GlobalCacheEngine:
             skipped_gpu_blocks=num_skipped,
             on_complete=on_complete,
         )
-
-    @staticmethod
-    def _collect_finalizers(*match_results: Optional[MatchResultAccel]) -> List[Callable]:
-        """Gather radixshmem match finalizers; process-internal tiers yield none."""
-        return [mr.finalize for mr in match_results
-                if mr is not None and mr.finalize is not None]
-
-    def _defer_node_release(self,
-                            device_type: DeviceType,
-                            node: object,
-                            ready_length: int,
-                            is_put: bool) -> Callable[[], None]:
-        """Lock ``node`` now; return a closure that unlocks + set_ready
-        (+ PUT publish) it, to run at graph completion."""
-        engine = self.cache_engines[device_type]
-        engine.lock_node(node)
-
-        def _release() -> None:
-            engine.release_node(node, ready_length)
-            if not is_put:
-                return
-            if device_type == DeviceType.CPU and self.cache_config.enable_p2p_cpu:
-                engine.local_index.insert_and_publish(node)
-            elif device_type == DeviceType.SSD and self.cache_config.enable_p2p_ssd:
-                engine.local_index.insert_and_publish(node)
-            elif device_type == DeviceType.REMOTE and self.enable_kv_sharing:
-                engine.insert_and_publish(node)
-        return _release
-
-    def _defer_recycle(self,
-                       device_type: DeviceType,
-                       blocks: np.ndarray) -> Optional[Callable[[], None]]:
-        """Return a closure recycling ``blocks`` back to ``device_type``'s pool,
-        or None when there is nothing to recycle."""
-        if len(blocks) == 0:
-            return None
-        engine = self.cache_engines[device_type]
-        return lambda: engine.recycle(blocks)
 
     @staticmethod
     def _matched_boundary_node(current_match, matched_blocks: int):
@@ -3618,11 +3549,55 @@ class GlobalCacheEngine:
                 if DeviceType.REMOTE in buffer_to_free:
                     assert self.remote_cache_engine is not None
                     self.remote_cache_engine.recycle(buffer_to_free[DeviceType.REMOTE])
-            # Closure-style completion actions (radixshmem planners): node
-            # release, buffer recycle, match-ref release -- each closure owns
-            # its own ordering.
+            # Closure-style completion actions (radixshmem planners and the
+            # converted local/global paths): node release, buffer recycle,
+            # match-ref release -- each closure owns its own ordering.
             for action in on_complete or []:
                 action()
+
+    @staticmethod
+    def _collect_finalizers(*match_results: Optional[MatchResultAccel]) -> List[Callable]:
+        """Gather radixshmem match finalizers; process-internal tiers yield none."""
+        finalizers = (getattr(mr, "finalize", None) for mr in match_results
+                      if mr is not None)
+        return [fin for fin in finalizers if fin is not None]
+
+    def _defer_node_release(self,
+                            device_type: DeviceType,
+                            node: object,
+                            ready_length: int,
+                            is_put: bool) -> Callable[[], None]:
+        """Lock ``node`` now; return a closure that unlocks + set_ready
+        (+ PUT publish) it, to run at graph completion."""
+        engine = self.cache_engines[device_type]
+        engine.lock_node(node)
+
+        def _release() -> None:
+            if ready_length > 0:
+                engine.release_node(node, ready_length)
+            else:
+                # Unlock-only anchor (mooncake deferred commit): readiness is
+                # published later by the deferred insert, never here.
+                engine.unlock(node)
+            if not is_put:
+                return
+            if device_type == DeviceType.CPU and self.cache_config.enable_p2p_cpu:
+                engine.local_index.insert_and_publish(node)
+            elif device_type == DeviceType.SSD and self.cache_config.enable_p2p_ssd:
+                engine.local_index.insert_and_publish(node)
+            elif device_type == DeviceType.REMOTE and self.enable_kv_sharing:
+                engine.insert_and_publish(node)
+        return _release
+
+    def _defer_recycle(self,
+                       device_type: DeviceType,
+                       blocks: np.ndarray) -> Optional[Callable[[], None]]:
+        """Return a closure recycling ``blocks`` back to ``device_type``'s pool,
+        or None when there is nothing to recycle."""
+        if len(blocks) == 0:
+            return None
+        engine = self.cache_engines[device_type]
+        return lambda: engine.recycle(blocks)
 
     @_synchronized_cache_tree
     def _abort_transfer_plan(self,
