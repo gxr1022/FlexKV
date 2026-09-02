@@ -570,6 +570,10 @@ class RankInfo:
             f", local_rank={self.local_rank}, effective_tp_rank={self.effective_tp_rank}"
         )
 
+
+RADIX_SWA_WINDOW_BLOCKS = 8
+
+
 @dataclass
 class SWAPoolConfig:
     """Configuration for SWA (Sliding Window Attention) host pool(s).

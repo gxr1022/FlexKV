@@ -37,7 +37,8 @@ import struct
 import time
 from typing import Dict, Generator, Optional, Tuple
 
-from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV, CacheConfig
+from flexkv.common.config import (GLOBAL_CONFIG_FROM_ENV, CacheConfig,
+                                  RADIX_SWA_WINDOW_BLOCKS)
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.transfer import DeviceType
 
@@ -253,6 +254,25 @@ def create_shm_radix_regions(cache_config: CacheConfig,
         n_blocks = device_blocks_from_config(dt, cache_config)
         if n_blocks <= 0:
             continue
+
+        component_kwargs = {}
+        tier_swa = (cache_config.swa.for_cache_tier(dt)
+                    if cache_config.swa is not None else None)
+        if dt == DeviceType.CPU and tier_swa is not None and tier_swa.num_slots > 0:
+            if tier_swa.num_slots < RADIX_SWA_WINDOW_BLOCKS:
+                # All-or-none window allocation: a pool smaller than one
+                # window can never store anything, so fail at startup.
+                raise ValueError(
+                    f"cache_config.swa.num_slots={tier_swa.num_slots} cannot "
+                    f"hold one {RADIX_SWA_WINDOW_BLOCKS}-block SWA window; "
+                    f"raise num_slots or disable SWA"
+                )
+            component_kwargs = dict(
+                component_mask=(shmradix.COMPONENT_MASK_FULL |
+                                shmradix.COMPONENT_MASK_SWA),
+                swa_window_blocks=RADIX_SWA_WINDOW_BLOCKS,
+                swa_max_blocks=tier_swa.num_slots,
+            )
         cfg = shmradix.ShmConfig(
             # A radix node holds >= 1 block, so node count won't exceed the
             # block count — size the node pool to n_blocks.
@@ -264,12 +284,16 @@ def create_shm_radix_regions(cache_config: CacheConfig,
             data_pool_ratio=data_pool_ratio,
             evict_ratio=evict_ratio,
             background_evict=background_evict,
+            **component_kwargs,
         )
         name = shm_name_for(dt, shm_radix_id)
         flexkv_logger.info(
             f"creating shm radix region {name} "
             f"(max_nodes={cfg.max_nodes}, max_blocks={cfg.max_blocks}, "
-            f"world_size={world_size})"
+            f"world_size={world_size}"
+            + (f", swa_window_blocks={cfg.swa_window_blocks}, "
+               f"swa_max_blocks={cfg.swa_max_blocks}" if component_kwargs else "")
+            + ")"
         )
         if world_size > 1:
             server_cfg = shmradix.RadixServerConfig()

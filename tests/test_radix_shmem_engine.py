@@ -392,13 +392,17 @@ def _force_radixshmem(engine,
             continue
         # No default for num_insert_blocks, mirroring the real signature: a
         # production caller that stopped passing it should fail here, loudly.
+        # `component` mirrors CacheEngineRadixShmem.insert's kwarg; these tiers
+        # are accel engines with no component pools, so only arity matters.
         def _insert(sequence_meta, physical_block_ids, num_insert_blocks,
-                    _sink=inserted):
+                    component=None, _sink=inserted):
             _sink.append((num_insert_blocks, np.asarray(physical_block_ids)))
 
         # Recording wrapper, not a replacement: the tier's own recycle still runs,
-        # so a planner that hands slots back really does free them.
-        def _recycle(physical_block_ids, _orig=tier.recycle, _sink=aborted):
+        # so a planner that hands slots back really does free them. `component`
+        # is accepted for signature parity and dropped.
+        def _recycle(physical_block_ids, component=None,
+                     _orig=tier.recycle, _sink=aborted):
             _sink.append(np.asarray(physical_block_ids))
             _orig(np.asarray(physical_block_ids))
 

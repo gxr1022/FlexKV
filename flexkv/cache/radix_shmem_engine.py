@@ -30,6 +30,12 @@ nothing -- neither reachable nor evictable, so they leak; and
 `insert(auto_recycle=True)` takes slot ownership, so the caller must not recycle
 the same slots again.
 
+Components: a region can also carry an SWA component (see `shm_radix_bootstrap`).
+All queries use radixshmem's component overload: Full-only passes
+`COMPONENT_MASK_FULL`; `FULL|SWA` (local-only) returns the joint hit plus the
+W-block window ending there. SWA slots live in their own all-or-none mempool,
+addressed by the `component=` parameter, and publish only after the Full path.
+
 Distributed (peer) reuse: with `peer_enabled` on a clustered region, `match()`
 walks the local tree, routes through the cluster's router hash table, and
 CONTINUES on a peer's tree over RDMA. The two spans are SPLICED, not ranked:
@@ -58,6 +64,7 @@ if TYPE_CHECKING:
     # These pull in the FlexKV C++ extension transitively; keep them out of
     # import-time so this module loads without CUDA/libtorch.
     from flexkv.common.block import SequenceMeta
+    from flexkv.common.config import SWAPoolConfig
     from flexkv.integration.dynamo.collector import KVEventCollector
 
 try:
@@ -67,6 +74,17 @@ except ImportError as e:  # pragma: no cover
     _SHMRADIX_IMPORT_ERROR = e
 else:
     _SHMRADIX_IMPORT_ERROR = None
+
+if shmradix is not None:
+    COMPONENT_MASK_FULL = int(shmradix.COMPONENT_MASK_FULL)
+    COMPONENT_MASK_SWA = int(shmradix.COMPONENT_MASK_SWA)
+    COMPONENT_FULL = shmradix.ComponentType.FULL
+    COMPONENT_SWA = shmradix.ComponentType.SWA
+else:  # keep the module importable for type checks / doc builds
+    COMPONENT_MASK_FULL = 1
+    COMPONENT_MASK_SWA = 2
+    COMPONENT_FULL = None
+    COMPONENT_SWA = None
 
 
 _DEVICE_TYPE_NAMES = ['CPU', 'GPU', 'SSD', 'REMOTE']
@@ -95,6 +113,11 @@ class ShmRadixMatch:
 
     The query ran with `lock=True`, so refs on both sides live until `release()`,
     which must run on every path or the prefix is pinned for the region's life.
+
+    A `FULL|SWA` match (local-only) also carries the window: `swa_slots` are
+    local SWA-pool slot ids covering `[swa_start, num_matched_blocks)`, where
+    `num_matched_blocks` is the joint `common_hit` -- possibly shorter than a
+    Full-only hit. Both stay empty under a Full-only mask.
     """
     num_local_blocks: int = 0
     num_peer_blocks: int = 0
@@ -103,6 +126,9 @@ class ShmRadixMatch:
     peer_slots: np.ndarray = field(
         default_factory=lambda: np.empty(0, dtype=np.int64))
     peer_id: int = NO_PEER
+    swa_start: int = 0
+    swa_slots: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.int64))
     finalize: Optional[Callable[[], None]] = None
 
     @property
@@ -170,6 +196,10 @@ class StagedRadixInsert:
     span has no reader), but it IS only legal while the ref keeping the local
     tree reaching the span's start is held -- pass that as ``holds``, which it
     drops afterwards.
+
+    ``component`` is one ComponentType (default FULL), not a query mask. A
+    Full+SWA PUT arms two instances, FULL first: SWA's insert refuses paths
+    the Full tree does not reach yet.
     """
 
     def __init__(self,
@@ -178,13 +208,15 @@ class StagedRadixInsert:
                  slots: np.ndarray,
                  path_end: int,
                  label: str,
-                 holds: Sequence[Callable[[], None]] = ()) -> None:
+                 holds: Sequence[Callable[[], None]] = (),
+                 component: "shmradix.ComponentType" = COMPONENT_FULL) -> None:
         self._engine = engine
         self._sequence_meta = sequence_meta
         self._slots = slots
         self._path_end = path_end
         self._label = label
         self._holds = list(holds)
+        self._component = component
         self._settled = False
 
     def publish(self) -> None:
@@ -198,13 +230,14 @@ class StagedRadixInsert:
                 self._sequence_meta,
                 self._slots,
                 num_insert_blocks=self._path_end,
+                component=self._component,
             )
         except Exception as e:
             flexkv_logger.error(
                 f"radixshmem {self._label}: insert of {len(self._slots)} "
                 f"staged slots failed: {e}; returning them to the mempool"
             )
-            self._engine.recycle(self._slots)
+            self._engine.recycle(self._slots, component=self._component)
         finally:
             self._release_holds()
 
@@ -248,7 +281,8 @@ class CacheEngineRadixShmem:
                  event_collector: Optional[KVEventCollector] = None,
                  metrics_collector=None,
                  protected_threshold: int = 2,
-                 peer_enabled: bool = False):
+                 peer_enabled: bool = False,
+                 swa_config: Optional["SWAPoolConfig"] = None):
         """Attach to an existing radix shm region by name; the owning RadixServer
         must already have been created (see `shm_radix_bootstrap`).
 
@@ -274,6 +308,9 @@ class CacheEngineRadixShmem:
         self.num_total_blocks = num_total_blocks
         self.evict_ratio = evict_ratio
         self.evict_start_threshold = evict_start_threshold
+
+        self._swa_config = (swa_config.for_cache_tier(device_type)
+                            if swa_config is not None else None)
 
         self.event_collector = event_collector
         self._metrics_collector = metrics_collector
@@ -309,6 +346,10 @@ class CacheEngineRadixShmem:
     def mempool(self) -> _MempoolView:
         return _MempoolView(self._tree)
 
+    @property
+    def swa_enabled(self) -> bool:
+        return self._swa_config is not None and self._swa_config.num_slots > 0
+
     # ---------- Lifecycle ----------
 
     def reset(self) -> None:
@@ -331,7 +372,9 @@ class CacheEngineRadixShmem:
               sequence_meta: SequenceMeta,
               *,
               with_peer: bool = True,
-              gpu_matched_blocks: int = 0) -> ShmRadixMatch:
+              gpu_matched_blocks: int = 0,
+              component_mask: int = COMPONENT_MASK_FULL,
+              query_end: Optional[int] = None) -> ShmRadixMatch:
         """Prefix-match against the shared (and maybe peer) index.
 
         `with_peer=False` (or a non-distributed region) restricts the walk to the
@@ -339,61 +382,72 @@ class CacheEngineRadixShmem:
         `gpu_matched_blocks` is accepted for parity with the accel/hie engines.
         The result is a SINGLE spliced match: a local head and, past it, a tail on
         one peer. See `ShmRadixMatch`.
+
+        `component_mask` defaults to Full-only, whose `common_hit` is the plain
+        prefix hit; `FULL|SWA` (local-only) adds the joint hit and the window.
+        `query_end` caps the queried path, so the window ends where the
+        caller's restore will.
         """
         local_only = not (with_peer and self.peer_enabled)
+        if (component_mask & COMPONENT_MASK_SWA) and not local_only:
+            raise ValueError(
+                "radixshmem SWA-aware match must be local-only; "
+                "pass with_peer=False"
+            )
         sequence_meta.gen_hashes()
         # SequenceMeta.block_hashes is int64; radixshmem expects uint64. They
         # share the same byte width, so view-cast is safe.
         hashes = sequence_meta.block_hashes.view(np.uint64)
+        if query_end is not None:
+            hashes = hashes[:query_end]
 
-        # lock=True inc_ref's [0, total_hit_length) across BOTH sides; qr.finalize,
+        # lock=True inc_ref's every component pin across BOTH sides; qr.finalize,
         # owned by the cache_engine layer, is the only thing that releases them.
-        qr = self._tree.query(hashes, local_only=local_only, lock=True)
+        qr = self._tree.query(hashes, mask=component_mask,
+                              local_only=local_only, lock=True)
+        # A refused query (status != OK) has zeroed fields and an unarmed
+        # finalize, so it falls through as an empty match -- like legacy query.
+        common_hit = int(qr.common_hit)
+        my_rank = int(self._tree.rank())
 
-        # The two spans are contiguous halves of one match, not alternatives.
-        total_hit = int(qr.total_hit_length)
-        local_hit = min(int(qr.local_hit_length), total_hit)
-        peer_rank = int(qr.remote_node_id)
-        peer_hit = (total_hit - local_hit) if peer_rank >= 0 else 0
-        # A peer_rank with no tail contributes nothing; treat it as local-only so
-        # downstream never builds an empty peer op.
-        if peer_hit <= 0:
-            peer_rank = NO_PEER
-            total_hit = local_hit
+        local_slots = np.empty(0, dtype=np.int64)
+        peer_slots = np.empty(0, dtype=np.int64)
+        peer_rank = NO_PEER
+        for source_rank, _offset, slot_ids in qr.full_fragments:
+            if int(source_rank) == my_rank:
+                local_slots = np.asarray(slot_ids, dtype=np.int64)
+            else:
+                peer_rank = int(source_rank)
+                peer_slots = np.asarray(slot_ids, dtype=np.int64)
+        local_hit = len(local_slots)
+        peer_hit = len(peer_slots)
+        if local_hit + peer_hit != common_hit:
+            self._finalize_and_raise(
+                qr,
+                f"radixshmem fragments cover {local_hit}+{peer_hit} blocks "
+                f"of a {common_hit}-block hit"
+            )
+
+        swa_slots = np.asarray(qr.swa_slots, dtype=np.int64)
+        swa_start = int(qr.swa_start) if len(swa_slots) > 0 else 0
+        if len(swa_slots) > 0 and swa_start + len(swa_slots) != common_hit:
+            self._finalize_and_raise(
+                qr,
+                f"radixshmem returned {len(swa_slots)} SWA slots at "
+                f"swa_start={swa_start} for a {common_hit}-block joint hit"
+            )
 
         if self._trace_peer:
             flexkv_logger.info(
                 f"[RADIX PEER QUERY] shm={self.shm_name} "
-                f"local_only={local_only} blocks={len(hashes)} "
+                f"local_only={local_only} mask={component_mask:#x} "
+                f"blocks={len(hashes)} "
                 f"local_hit={local_hit} peer_rank={peer_rank} "
-                f"peer_hit={peer_hit} total_hit={total_hit} "
+                f"peer_hit={peer_hit} common_hit={common_hit} "
+                f"swa_start={swa_start} swa_slots={len(swa_slots)} "
                 f"status={qr.status} "
                 f"rdma_reads={int(qr.rdma_read_count)} "
                 f"rdma_atomics={int(qr.rdma_atomic_count)}"
-            )
-
-        local_slots = np.asarray(qr.prefix_slots, dtype=np.int64)
-        if len(local_slots) < local_hit:
-            self._finalize_and_raise(
-                qr,
-                f"radixshmem returned {len(local_slots)} local slots for a "
-                f"{local_hit}-block local hit"
-            )
-
-        if peer_hit <= 0:
-            return ShmRadixMatch(
-                num_local_blocks=local_hit,
-                local_slots=local_slots[:local_hit],
-                finalize=qr.finalize,
-            )
-
-        peer_slots = np.asarray(qr.remote_slots, dtype=np.int64)
-        if len(peer_slots) < peer_hit:
-            self._finalize_and_raise(
-                qr,
-                f"radixshmem returned {len(peer_slots)} remote slots for a "
-                f"{peer_hit}-block peer tail (local_hit={local_hit}, "
-                f"total_hit={total_hit})"
             )
 
         # The cluster rank IS the FlexKV node id the data path addresses. Liveness
@@ -402,9 +456,11 @@ class CacheEngineRadixShmem:
         return ShmRadixMatch(
             num_local_blocks=local_hit,
             num_peer_blocks=peer_hit,
-            local_slots=local_slots[:local_hit],
-            peer_slots=peer_slots[:peer_hit],
-            peer_id=peer_rank,
+            local_slots=local_slots,
+            peer_slots=peer_slots,
+            peer_id=peer_rank if peer_hit > 0 else NO_PEER,
+            swa_start=swa_start,
+            swa_slots=swa_slots,
             finalize=qr.finalize,
         )
 
@@ -421,7 +477,8 @@ class CacheEngineRadixShmem:
     def insert(self,
                sequence_meta: SequenceMeta,
                physical_block_ids: np.ndarray,
-               num_insert_blocks: int) -> None:
+               num_insert_blocks: int,
+               component: "shmradix.ComponentType" = COMPONENT_FULL) -> None:
         """Attach already-written slots to the tree. Call ONLY after the transfer
         into `physical_block_ids` has landed -- an entry in the tree is by
         definition complete and servable.
@@ -460,14 +517,20 @@ class CacheEngineRadixShmem:
             )
 
         target_hashes = hashes[:path_end]
-        result = self._tree.insert(target_hashes, slots, start=start,
+        result = self._tree.insert(component, target_hashes, slots, start=start,
                                    auto_recycle=True)
 
         unused = len(result.unused_slots)
         landed = num_slots - unused
-        if result.error != shmradix.InsertError.OK:
+        if result.error == shmradix.InsertError.FULL_PATH_MISSING:
             flexkv_logger.warning(
-                f"radixshmem insert on {self.shm_name} returned "
+                f"radixshmem {component} insert on {self.shm_name}: full path "
+                f"[0, {path_end}) was evicted before the window published "
+                f"(slots were auto-recycled)"
+            )
+        elif result.error != shmradix.InsertError.OK:
+            flexkv_logger.warning(
+                f"radixshmem {component} insert on {self.shm_name} returned "
                 f"{result.error}: {landed}/{num_slots} blocks landed at "
                 f"start={start} (unused slots were auto-recycled)"
             )
@@ -477,13 +540,15 @@ class CacheEngineRadixShmem:
             # auto_recycle already returned the slots.
             return
 
-        if self.peer_enabled:
+        if self.peer_enabled and component == COMPONENT_FULL:
             # Until the RHT publication drains, this node's new blocks are
             # invisible cluster-wide. Not gated on PUT: a GET that stages a peer
-            # hit inserts too.
+            # hit inserts too. SWA windows are local-only by design, so they
+            # have nothing to publish.
             self._tree.flush()
 
-        if self.event_collector is not None and result.error == shmradix.InsertError.OK:
+        if (self.event_collector is not None and component == COMPONENT_FULL
+                and result.error == shmradix.InsertError.OK):
             # `landed` is a COUNT, not a range -- unused_slots merges leading
             # redundancy with an unlanded tail. Only on the error-free path can it
             # name blocks: we always supply exactly `path_end - start` slots, so
@@ -500,35 +565,43 @@ class CacheEngineRadixShmem:
 
     def take(self,
              num_required_blocks: int,
-             strict: bool = True) -> np.ndarray:
-        """Allocate slots, auto-evicting LRU as needed.
+             strict: bool = True,
+             component: "shmradix.ComponentType" = COMPONENT_FULL) -> np.ndarray:
+        """Allocate slots from one component's pool, auto-evicting LRU as needed.
 
         No `protected_node` to accept: the prefix a caller would want pinned is
         already held by its match's query ref, which auto-evict honours. The
         returned slots are un-evictable AND un-reclaimable until `insert()` or
         `recycle()`.
         """
-        slots_i32 = self._tree.allocate_slots(num_required_blocks)
+        slots_i32 = self._tree.allocate_slots(num_required_blocks,
+                                              component=component)
 
         slots = np.asarray(slots_i32, dtype=np.int64)
 
         if strict and len(slots) < num_required_blocks:
             # Caller will recycle whatever we returned; mirror CacheEngineAccel
             # by raising on shortfall.
-            self._tree.recycle_slots(np.asarray(slots, dtype=np.int32))
+            self._tree.recycle_slots(np.asarray(slots, dtype=np.int32),
+                                     component=component)
             raise RuntimeError(
-                f"radixshmem: not enough free blocks to take, required: "
-                f"{num_required_blocks}, available: {len(slots)}"
+                f"radixshmem: not enough free {component} blocks to take, "
+                f"required: {num_required_blocks}, available: {len(slots)}"
             )
 
-        if self._metrics_collector is not None and len(slots) > 0:
+        if (self._metrics_collector is not None and len(slots) > 0
+                and component == COMPONENT_FULL):
+            # SWA slots live in their own pool; counting them as tier block
+            # allocations would skew the Full mempool metrics.
             self._metrics_collector.record_allocation(
                 _DEVICE_TYPE_NAMES[self.device_type].lower(), len(slots)
             )
         return slots
 
-    def recycle(self, physical_blocks: np.ndarray) -> None:
-        """Give slots back to the mempool.
+    def recycle(self,
+                physical_blocks: np.ndarray,
+                component: "shmradix.ComponentType" = COMPONENT_FULL) -> None:
+        """Give slots back to their component's mempool.
 
         Also the only way back for slots whose transfer never completed: outside
         the tree they are unreachable by any query and invisible to eviction.
@@ -536,7 +609,7 @@ class CacheEngineRadixShmem:
         if physical_blocks is None or len(physical_blocks) == 0:
             return
         slots_i32 = np.ascontiguousarray(physical_blocks, dtype=np.int32)
-        self._tree.recycle_slots(slots_i32)
+        self._tree.recycle_slots(slots_i32, component=component)
 
     # ---------- Stats passthrough ----------
 
