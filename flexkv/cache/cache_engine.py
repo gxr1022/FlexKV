@@ -30,13 +30,19 @@ from flexkv.cache.redis_meta import RedisMeta, dist_available
 
 from flexkv.cache.mempool import Mempool
 from flexkv.cache.radix_shmem_engine import (
+    COMPONENT_FULL,
+    COMPONENT_MASK_FULL,
+    COMPONENT_MASK_SWA,
+    COMPONENT_SWA,
     ShmRadixMatch,
     StagedRadixInsert,
 )
 from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
 from flexkv.cache.swa_cache_engine import SWAOpConstructor
 from flexkv.common.block import SequenceMeta, format_block_hash
-from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV, SWAPoolConfig
+from flexkv.common.config import (CacheConfig, ModelConfig,
+                                  GLOBAL_CONFIG_FROM_ENV, SWAPoolConfig,
+                                  RADIX_SWA_WINDOW_BLOCKS)
 from flexkv.common.transfer import (
     CompletedOp,
     CompletionAwareCallback,
@@ -1203,6 +1209,7 @@ class GlobalCacheEngine:
             metrics_collector=self._metrics_collector,
             protected_threshold=self.protected_threshold,
             peer_enabled=peer_enabled,
+            swa_config=self.cache_config.swa,
         )
 
     def start(self) -> None:
@@ -2176,19 +2183,12 @@ class GlobalCacheEngine:
             on_complete=on_complete,
         )
 
-    def _assert_radixshmem_no_swa(self, phase: str) -> None:
-        """radixshmem mounts no SWA slot on a tree node, so a window written by
-        PUT would be invisible to every GET. Fail loudly rather than drop it."""
-        if self.swa_op_constructor.enabled:
-            raise NotImplementedError(
-                f"{phase} on the radixshmem backend does not support SWA "
-                f"(CacheEngineRadixShmem mounts no SWA slot on a tree node)"
-            )
-
     def _match_radixshmem(self,
                           sequence_meta: SequenceMeta,
                           temp_cache_strategy: CacheStrategy,
-                          is_get: bool) \
+                          is_get: bool,
+                          swa_aware: bool = False,
+                          swa_query_end: Optional[int] = None) \
                               -> Tuple[ShmRadixMatch, ShmRadixMatch]:
         """CPU + SSD matches for the radixshmem planners.
 
@@ -2199,11 +2199,26 @@ class GlobalCacheEngine:
         itself when the region has no peers) and a PUT is local-only, since
         ``transfer_engine`` routes no write into a peer's slots. ``is_get`` IS
         ``with_peer``. A tier that is absent or excluded yields an empty match.
+
+        ``swa_aware`` turns the CPU match into a local-only joint FULL|SWA query
+        capped at ``swa_query_end``: its ``num_matched_blocks`` is then the
+        common hit both components can serve, and the window (``swa_slots``)
+        ends exactly there. Only the CPU tier carries the SWA component; the SSD
+        match stays Full-only.
         """
         cpu_match = ShmRadixMatch()
         ssd_match = ShmRadixMatch()
         if self.cpu_cache_engine is not None:
-            cpu_match = self.cpu_cache_engine.match(sequence_meta, with_peer=is_get)
+            if swa_aware:
+                cpu_match = self.cpu_cache_engine.match(
+                    sequence_meta,
+                    with_peer=False,
+                    component_mask=COMPONENT_MASK_FULL | COMPONENT_MASK_SWA,
+                    query_end=swa_query_end,
+                )
+            else:
+                cpu_match = self.cpu_cache_engine.match(sequence_meta,
+                                                        with_peer=is_get)
         if self.ssd_cache_engine is not None and not temp_cache_strategy.ignore_ssd:
             ssd_match = self.ssd_cache_engine.match(sequence_meta, with_peer=is_get)
         return cpu_match, ssd_match
@@ -2240,10 +2255,10 @@ class GlobalCacheEngine:
         enable_gpu = not temp_cache_strategy.ignore_gpu
         assert self.cache_config.enable_cpu
         assert self.cpu_cache_engine is not None
-        self._assert_radixshmem_no_swa("GET")
-
+        swa_active = swa_aware and self.swa_op_constructor.enabled
         cpu_match, ssd_match = self._match_radixshmem(
-            sequence_meta, temp_cache_strategy, is_get=True)
+            sequence_meta, temp_cache_strategy, is_get=True,
+            swa_aware=swa_active, swa_query_end=block_mask_end)
 
         def _release_match() -> GetTransferPlan:
             # Nothing will consume the matched prefix; drop the query's ref now.
@@ -2255,8 +2270,13 @@ class GlobalCacheEngine:
             nvtx.end_range(nvtx_range)
             return self._empty_get_return(request_id)
 
+        # [block_mask_start, span_hi) is what this GET may restore; SWA clamps
+        # the hi end to the joint hit so the window stays the restored tail.
+        span_hi = block_mask_end
+        if swa_active:
+            span_hi = min(span_hi, cpu_match.num_matched_blocks)
         spans = _shm_get_spans(cpu_match, ssd_match,
-                               block_mask_start, block_mask_end)
+                               block_mask_start, span_hi)
         num_staged = sum(len(span) for span in spans if span.needs_staging)
 
         staging = np.empty(0, dtype=np.int64)
@@ -2280,6 +2300,13 @@ class GlobalCacheEngine:
         if not spans:
             return _release_match()
         end = spans[-1].end
+        if swa_active and end != cpu_match.num_matched_blocks:
+            flexkv_logger.warning(
+                f"radixshmem GET {request_id}: plan ends at {end} but the "
+                f"joint FULL|SWA hit ends at {cpu_match.num_matched_blocks}; "
+                f"degrading to a miss"
+            )
+            return _release_match()
 
         if self._metrics_collector is not None:
             cpu_blocks = sum(len(span) for span in spans if span.tier == "cpu")
@@ -2332,6 +2359,16 @@ class GlobalCacheEngine:
             # No H2D to hang the contract on (prefetch-style GET): the staging
             # ops are the terminals.
             finished_ops_ids = list(staging_ops_ids)
+
+        if swa_active and enable_gpu and len(cpu_match.swa_slots) > 0:
+            swa_h2d_id = self.swa_op_constructor.build_get_chain(
+                transfer_graph,
+                gpu_slot_ids=np.zeros(len(cpu_match.swa_slots), dtype=np.int64),
+                cpu_slot_ids=cpu_match.swa_slots,
+                dp_client_id=dp_client_id,
+            )
+            if swa_h2d_id is not None:
+                finished_ops_ids.append(swa_h2d_id)
 
         cleanups: List[Callable[[], None]] = []
         if len(staging) > 0:
@@ -3116,7 +3153,6 @@ class GlobalCacheEngine:
         assert enable_gpu
         assert self.cache_config.enable_cpu
         assert self.cpu_cache_engine is not None
-        self._assert_radixshmem_no_swa("PUT")
 
         cpu_match, ssd_match = self._match_radixshmem(
             sequence_meta, temp_cache_strategy, is_get=False)
@@ -3137,7 +3173,9 @@ class GlobalCacheEngine:
         num_cpu_new = block_mask_end - cpu_tot
         num_ssd_new = block_mask_end - ssd_tot
         # Same policy as _put_impl_local: a fully-matched CPU prefix ends the PUT
-        # even when SSD is still short of it.
+        # even when SSD is still short of it. This also skips the SWA sidecar,
+        # so a window lost to SWA-pool eviction is not republished until the
+        # Full path ages out (accepted MVP limitation).
         if num_cpu_new == 0:
             return _release_match()
 
@@ -3161,6 +3199,23 @@ class GlobalCacheEngine:
             if self._metrics_collector is not None:
                 self._metrics_collector.record_allocation_failure("local")
             return _release_match()
+
+        swa_new: Optional[np.ndarray] = None
+        if self.swa_op_constructor.enabled:
+            k = min(block_mask_end, RADIX_SWA_WINDOW_BLOCKS)
+            swa_take = self.cpu_cache_engine.take(num_required_blocks=k,
+                                                  strict=False,
+                                                  component=COMPONENT_SWA)
+            if len(swa_take) == k:
+                swa_new = swa_take
+            else:
+                # All-or-none contract says this is empty; recycle defensively
+                # in case it ever is not.
+                self.cpu_cache_engine.recycle(swa_take, component=COMPONENT_SWA)
+                flexkv_logger.warning(
+                    f"radixshmem PUT {request_id}: no {k}-slot SWA window "
+                    f"available; storing Full KV only"
+                )
 
         transfer_graph = TransferOpGraph()
         finished_ops_ids: List[int] = []
@@ -3197,20 +3252,38 @@ class GlobalCacheEngine:
             transfer_graph.add_transfer_op(op_h2disk)
             transfer_graph.add_dependency(op_h2disk.op_id, op_d2h.op_id)
 
+        if swa_new is not None:
+            swa_ops = self.swa_op_constructor.build_put_chain(
+                transfer_graph,
+                gpu_slot_ids=np.zeros(len(swa_new), dtype=np.int64),
+                cpu_slot_ids=swa_new,
+                dp_client_id=dp_client_id,
+                return_op_ids=True,
+            )
+            assert swa_ops.d2h_id is not None
+            finished_ops_ids.append(swa_ops.d2h_id)
+
         on_complete: List[Callable[[], None]] = []
 
         def _arm(engine, slots: np.ndarray,
-                 hold: Callable[[], None], label: str) -> None:
+                 hold: Optional[Callable[[], None]], label: str,
+                 component=COMPONENT_FULL) -> None:
             staged = StagedRadixInsert(engine=engine,
                                         sequence_meta=sequence_meta,
                                         slots=slots,
                                         path_end=block_mask_end,
                                         label=label,
-                                        holds=[hold])
+                                        holds=[] if hold is None else [hold],
+                                        component=component)
             on_complete.append(staged.publish)
 
         _arm(self.cpu_cache_engine, cpu_new,
-             cpu_match.release, f"PUT {request_id} CPU")
+             cpu_match.release if swa_new is None else None,
+             f"PUT {request_id} CPU")
+        if swa_new is not None:
+            _arm(self.cpu_cache_engine, swa_new,
+                 cpu_match.release, f"PUT {request_id} CPU SWA",
+                 component=COMPONENT_SWA)
         if len(ssd_new) > 0:
             _arm(self.ssd_cache_engine, ssd_new,
                  ssd_match.release, f"PUT {request_id} SSD")
