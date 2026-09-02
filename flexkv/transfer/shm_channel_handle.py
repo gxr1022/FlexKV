@@ -279,8 +279,9 @@ class _TEShmDispatcher:
             for op in completed:
                 with self._owner_lock:
                     owner = self._graph_owner.get(op.graph_id)
-                    if op.is_graph_completed():
-                        # Graph done — drop the mapping after we've grouped.
+                    if op.op_id == -1:
+                        # Terminal message (completed OR failed) — drop the
+                        # mapping after we've grouped, or failed graphs leak it.
                         self._graph_owner.pop(op.graph_id, None)
                 if owner is None:
                     flexkv_logger.warning(
@@ -331,6 +332,10 @@ def te_shm_main(model_config: ModelConfig,
         tm = TransferManager(model_config, cache_config, gpu_register_port)
         tm.initialize_transfer_engine()
         tm.start()
+        # TransferManager binds a GPU-control REP socket in __init__; every
+        # deployment mode must service it or a client suspend/resume call
+        # stalls for the full 120s RCVTIMEO.
+        tm.start_gpu_control_listener()
 
         # Phase 3: bind TM, flip ready flag, launch poll threads.
         dispatcher.start_dispatch(tm)

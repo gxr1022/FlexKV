@@ -119,8 +119,12 @@ _FRAG_HDR_SIZE = _FRAG_HDR.size  # 5
 
 
 # CompletedOp result-ring record: graph_id/op_id (i64), transfer_type (u8 index),
-# num_blocks (u32), num_bytes (u64).
-_COMPLETED_OP = struct.Struct("<qqBIQ")
+# num_blocks (u32), num_bytes (u64), flags (u8: bit0 = failed).
+# block_results does NOT cross the ring: a failed graph degrades to whole-task
+# failure on the client side, which is the correct conservative reading for
+# every backend the shm path serves (mooncake's partial success never runs
+# through this channel).
+_COMPLETED_OP = struct.Struct("<qqBIQB")
 COMPLETED_OP_WIRE_SIZE = _COMPLETED_OP.size
 
 # transfer_type frozen as a byte index; 0xFF = None (VIRTUAL ops).
@@ -134,18 +138,19 @@ _TT_NAME_TO_IDX = {name: i for i, name in enumerate(_TT_NAMES)}
 
 
 def encode_completed_op(op: Any) -> bytes:
-    """Pack a CompletedOp into its 29-byte fixed-width record."""
+    """Pack a CompletedOp into its fixed-width record."""
     tt = op.transfer_type
     tt_idx = _TT_NONE if tt is None else _TT_NAME_TO_IDX[tt]
+    flags = 1 if getattr(op, "failed", False) else 0
     return _COMPLETED_OP.pack(
-        op.graph_id, op.op_id, tt_idx, op.num_blocks, op.num_bytes,
+        op.graph_id, op.op_id, tt_idx, op.num_blocks, op.num_bytes, flags,
     )
 
 
 def decode_completed_op(buf: Any, off: int) -> Any:
     """Unpack a CompletedOp record from `buf` at byte offset `off`."""
     from flexkv.common.transfer import CompletedOp
-    graph_id, op_id, tt_idx, num_blocks, num_bytes = \
+    graph_id, op_id, tt_idx, num_blocks, num_bytes, flags = \
         _COMPLETED_OP.unpack_from(buf, off)
     tt = None if tt_idx == _TT_NONE else _TT_NAMES[tt_idx]
     return CompletedOp(
@@ -154,6 +159,7 @@ def decode_completed_op(buf: Any, off: int) -> Any:
         transfer_type=tt,
         num_blocks=num_blocks,
         num_bytes=num_bytes,
+        failed=bool(flags & 1),
     )
 
 
