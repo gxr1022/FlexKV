@@ -517,8 +517,8 @@ class CacheEngineRadixShmem:
             )
 
         target_hashes = hashes[:path_end]
-        result = self._tree.insert(component, target_hashes, slots, start=start,
-                                   auto_recycle=True)
+        result = self._tree.insert(target_hashes, slots, start=start,
+                                   auto_recycle=True, component=component)
 
         unused = len(result.unused_slots)
         landed = num_slots - unused
