@@ -570,6 +570,10 @@ class RankInfo:
             f", local_rank={self.local_rank}, effective_tp_rank={self.effective_tp_rank}"
         )
 
+
+RADIX_SWA_WINDOW_BLOCKS = 8
+
+
 @dataclass
 class SWAPoolConfig:
     """Configuration for SWA (Sliding Window Attention) host pool(s).
@@ -584,6 +588,8 @@ class SWAPoolConfig:
     num_remote_slots: int = 0          # Number of REMOTE SWA pool slots (0 = no REMOTE SWA tier)
     num_swa_layers: int = 61           # Number of SWA layers (all 61 for DSv4)
     bytes_per_token_per_layer: int = 584  # nope_fp8(448) + rope_bf16(128) + scale(8)
+
+    window_blocks: int = RADIX_SWA_WINDOW_BLOCKS
     # True when the SWA page also carries heterogeneous sidecar groups (for
     # example DeepSeek-V4 attention/indexer compress states).
     multi_group: bool = False
