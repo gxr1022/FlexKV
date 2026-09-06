@@ -517,7 +517,11 @@ class CacheEngineRadixShmem:
             )
 
         target_hashes = hashes[:path_end]
-        result = self._tree.insert(target_hashes, slots, start=start,
+        # `start` positions FULL slots only. SWA/MAMBA inserts are right-aligned
+        # by radixshmem itself (slots cover [max(0, n-W), n)) and refuse a
+        # non-zero start with BAD_REQUEST.
+        tree_start = start if component == COMPONENT_FULL else 0
+        result = self._tree.insert(target_hashes, slots, start=tree_start,
                                    auto_recycle=True, component=component)
 
         unused = len(result.unused_slots)

@@ -286,8 +286,7 @@ def create_shm_radix_regions(cache_config: CacheConfig,
             # RadixClient.block_size() instead of being told out-of-band.
             block_size=cache_config.tokens_per_block,
             data_pool_ratio=data_pool_ratio,
-            evict_ratio=evict_ratio,
-            background_evict=background_evict,
+            background_evict_ratio=(evict_ratio if background_evict else 0.0),
             **component_kwargs,
         )
         name = shm_name_for(dt, shm_radix_id)
