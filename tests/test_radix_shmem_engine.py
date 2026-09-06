@@ -1423,7 +1423,6 @@ def _rank_main(rank, prefix, cluster_id, registry, rdma_dev, ready, done, output
             max_blocks=1170,
             block_size=16,
             data_pool_ratio=8,
-            background_evict=True,
         )
         # FlexKV leaves node_name/cluster_id to shmradix; this test sets them so
         # one host's two ranks get a private namespace and distinct region names.
