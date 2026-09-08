@@ -8,7 +8,7 @@ import hashlib
 from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV, CacheConfig, LayerGroupSpec, ModelConfig
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
-from flexkv.common.storage import StorageHandle, KVCacheLayout, KVCacheLayoutType
+from flexkv.common.storage import AccessHandleType, StorageHandle, KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import DeviceType
 from flexkv.storage.allocator import (
     CPUAllocator,
@@ -16,6 +16,8 @@ from flexkv.storage.allocator import (
     HugePageAllocator,
     RemoteAllocator,
     SSDAllocator,
+    SlotStoreTensorHandle,
+    slot_store_pool_tensor,
 )
 
 
@@ -47,8 +49,15 @@ class StorageEngine:
                  model_config: ModelConfig,
                  cache_config: CacheConfig,
                  num_layers_per_pp_stage: int,
-                 swa_layer_groups: Optional[List[LayerGroupSpec]] = None):
-        """Initialize storage engine"""
+                 swa_layer_groups: Optional[List[LayerGroupSpec]] = None,
+                 radix_client: Any = None):
+        """Initialize storage engine.
+
+        ``radix_client`` (a ``shmradix.RadixClient``, radixshmem mode) makes the
+        CPU FULL / SWA pools views of the radix-server's SlotStore instead of
+        allocations of this process; see ``_attach_radix_pool``.
+        """
+        self._radix_client = radix_client
         self._storage_handles: Dict[Tuple[DeviceType, int], StorageHandle] = {}
         # SWA dedicated GPU pool handles, physically isolated from the main-KV
         # _storage_handles so the SAME physical device_id can hold both a main-KV
@@ -96,11 +105,14 @@ class StorageEngine:
                 layer_groups=self._model_config.layer_groups,
                 tp_size=self._model_config.tp_size,
             )
-            self.allocate(
-                device_type=DeviceType.CPU,
-                layout=self._cpu_layout,
-                dtype=buffer_dtype,
-            )
+            if self._radix_client is not None:
+                self._attach_radix_pool(self._cpu_layout, buffer_dtype, is_swa=False)
+            else:
+                self.allocate(
+                    device_type=DeviceType.CPU,
+                    layout=self._cpu_layout,
+                    dtype=buffer_dtype,
+                )
 
         if self._cache_config.enable_ssd:
             if not GLOBAL_CONFIG_FROM_ENV.ssd_layout_type == self._cpu_layout.type:
@@ -175,15 +187,18 @@ class StorageEngine:
                     layer_groups=self._swa_layer_groups,
                     tp_size=self._model_config.tp_size,
                 )
-                self.allocate(
-                    device_type=DeviceType.CPU,
-                    layout=self._swa_cpu_layout,
-                    dtype=torch.uint8,
-                    device_id=0,
-                    raw_data=None,
-                    is_swa=True,
-                    pin_memory=swa_cfg.pin_memory,
-                )
+                if self._radix_client is not None:
+                    self._attach_radix_pool(self._swa_cpu_layout, torch.uint8, is_swa=True)
+                else:
+                    self.allocate(
+                        device_type=DeviceType.CPU,
+                        layout=self._swa_cpu_layout,
+                        dtype=torch.uint8,
+                        device_id=0,
+                        raw_data=None,
+                        is_swa=True,
+                        pin_memory=swa_cfg.pin_memory,
+                    )
 
 
             if self._cache_config.enable_ssd and swa_cfg.num_ssd_slots > 0:
@@ -260,6 +275,62 @@ class StorageEngine:
                         remote_config_custom=self._cache_config.remote_config_custom,
                     )
 
+
+    def _attach_radix_pool(self,
+                           layout: KVCacheLayout,
+                           dtype: torch.dtype,
+                           is_swa: bool) -> None:
+        """CPU pool from the radix-server's SlotStore (radixshmem mode).
+
+        The FULL pool backs the main KV blocks, the SWA pool the SWA pages; a
+        slot is one block, so the pool viewed as a tensor has exactly the layout
+        FlexKV's own allocation would have had. Slot count and stride are
+        re-checked against ``layout`` here: a mismatch would otherwise become a
+        misaddressed transfer, not an error. Workers re-attach the pool by name
+        through the ``SlotStoreTensorHandle`` in ``worker_data``.
+        """
+        from shmradix import ComponentType
+        from flexkv.server.shm_radix_bootstrap import layout_block_bytes
+
+        kind = ComponentType.SWA if is_swa else ComponentType.FULL
+        store = self._radix_client.store
+        if not store.has_pool(kind):
+            raise ValueError(
+                f"radix-server SlotStore {store.name} has no {kind.name} pool but the "
+                f"FlexKV configuration needs one")
+        pool = store.pool(kind)
+        block_bytes = layout_block_bytes(layout, dtype)
+        if int(pool.num_slots) != int(layout.num_block):
+            raise ValueError(
+                f"radix-server {kind.name} pool has {pool.num_slots} slots, FlexKV's CPU "
+                f"layout has {layout.num_block} blocks; the bootstrap and the TE disagree "
+                f"on the block count")
+        if int(pool.slot_bytes) != block_bytes:
+            raise ValueError(
+                f"radix-server {kind.name} slot stride is {pool.slot_bytes} B, FlexKV's CPU "
+                f"block is {block_bytes} B; the bootstrap and the TE disagree on the "
+                f"block layout")
+        num_elements = layout.get_total_elements()
+        tensor = slot_store_pool_tensor(store, kind, dtype, num_elements)
+        handle = StorageHandle(
+            handle_type=AccessHandleType.TENSOR,
+            data=tensor,
+            kv_layout=layout,
+            dtype=dtype,
+            worker_data=SlotStoreTensorHandle(
+                data_name=store.name,
+                hugepage_path=self._radix_client.info.hugepage_path,
+                kind=int(kind),
+                num_elements=num_elements,
+                dtype=dtype,
+            ),
+        )
+        handles = self._swa_storage_handles if is_swa else self._storage_handles
+        handles[(DeviceType.CPU, 0)] = handle
+        flexkv_logger.info(
+            f"[StorageEngine] CPU {'SWA' if is_swa else 'KV'} pool = radix-server SlotStore "
+            f"{store.name} {kind.name} pool: {pool.num_slots} slots x {pool.slot_bytes} B "
+            f"({pool.num_slots * pool.slot_bytes / 2**30:.2f} GiB)")
 
     def register_gpu_blocks(self,
                             gpu_blocks: List[TensorSharedHandle],

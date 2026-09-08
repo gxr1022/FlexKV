@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Feature
 
+Universal:
+- radixshmem mode now uses radixshmem's data plane: the CPU KV pool is the radix-server's SlotStore (one slot per block, attached by name in the TE and every transfer worker) and cross-node reuse is `RadixClient.get_async` from the prefetch path (server-side RDMA READ), replacing FlexKV's own CPU allocation, `PEER2CPUTransferWorker`, mooncake wrapper and Redis address book on this path. The radix-server runs as a subprocess of the bootstrap DP (`FLEXKV_RADIX_SERVER_LAUNCH_MODE`). radixshmem mode is CPU-tier only (`ssd_cache_gb` must be 0). See `docs/radixshmem_integration.md` and `docs/radixshmem_cross_node.md`
+
 Targeting SGLang:
 - The native FlexKV backend is available in upstream SGLang `v0.5.16` and later; no patch is required ([sglang#29701](https://github.com/sgl-project/sglang/pull/29701))
 - Add DeepSeek-V4 support for heterogeneous C4/C128/indexer KV groups, FullKV + SWA dual caches, attention/indexer compress-state sidecars, and layerwise restore ([#225](https://github.com/taco-project/FlexKV/pull/225))

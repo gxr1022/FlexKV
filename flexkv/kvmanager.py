@@ -63,12 +63,17 @@ class KVManager:
 
         self.use_radix_shmem = GLOBAL_CONFIG_FROM_ENV.radix_shmem
         if self.use_radix_shmem and cache_config.enable_remote:
-            # CacheEngineRadixShmem indexes the CPU/SSD tiers it owns in shm and
-            # reaches peers over RDMA; but the 3rd-party (PCFS) tier has its own
+            # CacheEngineRadixShmem indexes the CPU tier in shm and reaches
+            # peers over RDMA; but the 3rd-party (PCFS) tier has its own
             # Redis-published index and GET planner.
             raise ValueError(
                 "radix_shmem and enable_remote (3rd-party remote storage) "
                 "cannot be enabled at the same time"
+            )
+        if self.use_radix_shmem and cache_config.enable_ssd:
+            raise ValueError(
+                "radix_shmem backs the CPU tier only (index + SlotStore + peer "
+                "pull); set ssd_cache_gb=0 / enable_ssd=False"
             )
         self._shm_radix_id = GLOBAL_CONFIG_FROM_ENV.shm_radix_id
 
@@ -115,9 +120,9 @@ class KVManager:
         # so it doubles as the radix-shmem path's per-CE id: disjoint graph/op id
         # ranges and TE channel number.
         self.dp_client_id = dp_client_id
-        # Owner handle for shm radix regions — only the bootstrap process
+        # The embedded radix-server subprocess — only the bootstrap process
         # holds this; others have None.
-        self._shm_radix_owners = None
+        self._shm_radix_server = None
         # TE-process handle — only the bootstrap process holds this.
         self._shm_te_process = None
         # Local KVTaskEngine for the radix-shmem path (per-DP).
@@ -186,49 +191,70 @@ class KVManager:
         TransferOp.set_op_id_range(self.dp_client_id << 32,
                                    (self.dp_client_id + 1) << 32)
 
-        if self.dp_client_id == 0:
-            self._bootstrap_radix_shmem()
+        try:
+            if self.dp_client_id == 0:
+                self._bootstrap_radix_shmem()
 
-        # GlobalCacheEngine reads GLOBAL_CONFIG_FROM_ENV.radix_shmem and builds a
-        # CacheEngineRadixShmem (RadixClient) per device type.
-        self.kv_task_engine = KVTaskEngine(
-            self.model_config, self.cache_config,
-            self.gpu_register_port,
-            redis_meta=self.redis_meta_client,
-            event_collector=event_collector,
-            shm_te_server_id=self._shm_radix_id,
-            shm_te_channel_id=self.dp_client_id,
-        )
+            # GlobalCacheEngine reads GLOBAL_CONFIG_FROM_ENV.radix_shmem and
+            # builds a CacheEngineRadixShmem (RadixClient) for the CPU tier.
+            self.kv_task_engine = KVTaskEngine(
+                self.model_config, self.cache_config,
+                self.gpu_register_port,
+                redis_meta=self.redis_meta_client,
+                event_collector=event_collector,
+                shm_te_server_id=self._shm_radix_id,
+                shm_te_channel_id=self.dp_client_id,
+            )
+        except BaseException:
+            # A failure after the TE / radix-server subprocesses were spawned
+            # must not leave them running (the TE would wait for GPU
+            # registrations forever).
+            self._shutdown_radix_shmem_children()
+            raise
+
+    def _shutdown_radix_shmem_children(self) -> None:
+        if self._shm_te_process is not None:
+            self._shm_te_process.shutdown()
+            self._shm_te_process = None
+        if self._shm_radix_server is not None:
+            self._shm_radix_server.shutdown()
+            self._shm_radix_server = None
 
     def _bootstrap_radix_shmem(self) -> None:
-        """Bootstrap proc (dp 0) only: create the shm regions, claim this node's
-        id, and spawn the shared TE."""
-        from flexkv.server.shm_radix_bootstrap import create_shm_radix_regions
+        """Bootstrap proc (dp 0) only: bring up this node's radix-server (index +
+        SlotStore + peer transfer) and spawn the shared TE.
+
+        The server is a subprocess (``FLEXKV_RADIX_SERVER_LAUNCH_MODE=embedded``)
+        or one the operator started (``external``); either way every FlexKV
+        process attaches by name. Peer reuse needs no Redis address book any
+        more: the server resolves peers through etcd and pulls their blocks
+        itself (``RadixClient.get_async`` from the prefetch path)."""
+        from flexkv.server.shm_radix_bootstrap import (RadixServerProcess,
+                                                       build_radix_server_config,
+                                                       radix_socket_path)
         from flexkv.transfer_manager import TransferManagerShmTEProcess
 
-        self._shm_radix_owners = create_shm_radix_regions(
-            self.cache_config, shm_radix_id=self._shm_radix_id
-        )
-
-        if self.cache_config.enable_kv_sharing:
-            node_id = self._shm_radix_owners.cluster_rank
-            self.redis_meta_client = RedisMeta(
-                self.cache_config.redis_host,
-                self.cache_config.redis_port,
-                self.cache_config.redis_password,
-                self.cache_config.local_ip,
-                node_ttl_seconds=self.cache_config.node_ttl_seconds,
+        launch_mode = GLOBAL_CONFIG_FROM_ENV.radix_server_launch_mode
+        if launch_mode not in ("embedded", "external"):
+            raise ValueError(
+                "FLEXKV_RADIX_SERVER_LAUNCH_MODE must be embedded or external, "
+                f"got {launch_mode!r}"
             )
-            if self.redis_meta_client.init_meta(node_id) is None:
-                raise RuntimeError(
-                    f"Failed to register radix cluster rank {node_id} as FlexKV "
-                    f"node id: {self.redis_meta_client.get_init_error()}"
-                )
-            self.cache_config.distributed_node_id = int(node_id)
+        if launch_mode == "embedded":
+            server_cfg = build_radix_server_config(
+                self.model_config, self.cache_config, self._shm_radix_id
+            )
+            self._shm_radix_server = RadixServerProcess(server_cfg).start()
+            self.cache_config.distributed_node_id = int(
+                self._shm_radix_server.cluster_rank)
             flexkv_logger.info(
-                f"[kv manager] radix node {self._shm_radix_id} = FlexKV "
-                f"node id {node_id}, registered at "
-                f"{self.cache_config.redis_host}:{self.cache_config.redis_port}"
+                f"[kv manager] radix-server for {self._shm_radix_id} is up: "
+                f"cluster rank {self.cache_config.distributed_node_id}"
+            )
+        else:
+            flexkv_logger.info(
+                f"[kv manager] attaching to an external radix-server at "
+                f"{GLOBAL_CONFIG_FROM_ENV.radix_endpoint or radix_socket_path(self._shm_radix_id)}"
             )
 
         # Extra channels past the internal DP clients let external processes (e.g.
@@ -278,12 +304,8 @@ class KVManager:
                 self.kv_task_engine.shutdown()
 
         # Multi-DP radix-shmem teardown — only the bootstrap proc owns these.
-        if self._shm_te_process is not None:
-            self._shm_te_process.shutdown()
-            self._shm_te_process = None
-        if self._shm_radix_owners is not None:
-            self._shm_radix_owners.shutdown()
-            self._shm_radix_owners = None
+        # TE first: its workers map the server's SlotStore.
+        self._shutdown_radix_shmem_children()
 
         if self.owns_mps:
             flexkv_logger.info(

@@ -217,6 +217,11 @@ class FlexKVConnector:
         # Heterogeneous groups change the bytes represented by one logical
         # FlexKV block. Recompute CPU/SSD capacities before KVManager starts.
         self._apply_layer_groups_for_cache_sizing(kv_caches, indexer_buffers)
+        # The radixshmem bootstrap sizes the host SWA slot from the config, before
+        # the TE learns the DSv4 sidecar groups from the GPU registration.
+        if self._is_dsv4 and self.cache_config.swa is not None:
+            _, _, swa_layer_groups, _, _ = self._build_dsv4_swa_registration()
+            self.cache_config.swa.layer_groups = swa_layer_groups
         self._label = f"[model_config={self.model_config}, rank_info={self.rank_info}]"
 
         # 5. On multi-node setups, every node beyond node 0 needs a
@@ -309,6 +314,10 @@ class FlexKVConnector:
             self.cache_config.enable_ssd
             or self.cache_config.enable_remote
             or self.cache_config.enable_kv_sharing
+            # radixshmem cluster: prefetch is where a peer's blocks are pulled
+            # into this node (RadixClient.get_async); GET then matches locally.
+            or (GLOBAL_CONFIG_FROM_ENV.radix_shmem
+                and GLOBAL_CONFIG_FROM_ENV.radix_world_size > 1)
         )
         self._shutdown_done = False
 
@@ -1364,7 +1373,10 @@ class FlexKVConnector:
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
                 prefetch_result = self.kv_manager.prefetch_async(
-                    token_ids=np.asarray(token_ids, dtype=np.int64)
+                    token_ids=np.asarray(token_ids, dtype=np.int64),
+                    # Same joint Full+SWA rule as lookup_kv: without the SWA
+                    # window a later swa_aware match cannot use the prefix.
+                    swa_aware=self._swa_kv_pool is not None,
                 )
                 # KVManager currently returns
                 # ``(task_id, actual_prefetch_tokens)`` even though older
@@ -2196,82 +2208,11 @@ class FlexKVConnector:
             )
         logger.info("[FlexKV] Registered KV caches to server %s", self._label)
 
-    def _register_dsv4_to_server(self, kv_caches: List[torch.Tensor]) -> None:
-        """Register DSv4 main KV groups plus SWA/state sidecars."""
-        layer_groups: List[LayerGroupSpec] = []
-        gpu_layouts: List[KVCacheLayout] = []
-        handles_per_group: List[List[torch.Tensor]] = []
-        all_buffers: List[torch.Tensor] = []
-
-        for group in self._dsv4_layer_groups:
-            buffers = group["buffers"]
-            sample = buffers[0]
-            if sample.ndim != 2:
-                raise RuntimeError(
-                    f"FlexKV DSv4 group {group['name']!r} expects 2D page "
-                    f"buffers, got shape={tuple(sample.shape)}"
-                )
-            if any(buf.shape != sample.shape for buf in buffers):
-                raise RuntimeError(
-                    f"FlexKV DSv4 group {group['name']!r} has mixed shapes"
-                )
-            sub_page_size = int(group["sub_page_size"])
-            if self.page_size % int(group["ratio"]) != 0:
-                raise RuntimeError(
-                    f"FlexKV page_size={self.page_size} is not divisible by "
-                    f"DSv4 ratio={group['ratio']}"
-                )
-            if sample.shape[1] % sub_page_size != 0:
-                raise RuntimeError(
-                    f"FlexKV DSv4 group {group['name']!r} page stride "
-                    f"{sample.shape[1]} is not divisible by {sub_page_size}"
-                )
-            head_size = sample.shape[1] // sub_page_size
-            layer_groups.append(
-                LayerGroupSpec(
-                    num_layers=len(group["layer_ids"]),
-                    num_kv_heads=1,
-                    head_size=head_size,
-                    layer_indices=list(group["layer_ids"]),
-                    compress_ratio=int(group["ratio"]),
-                    dtype=group["dtype"],
-                )
-            )
-            gpu_layouts.append(
-                KVCacheLayout(
-                    type=KVCacheLayoutType.LAYERFIRST,
-                    num_layer=len(group["layer_ids"]),
-                    num_block=sample.shape[0],
-                    tokens_per_block=sub_page_size,
-                    num_head=1,
-                    head_size=head_size,
-                    kv_dim=self.model_config.kv_dim,
-                    num_kv_heads=self.model_config.num_kv_heads,
-                )
-            )
-            handles_per_group.append(list(buffers))
-            all_buffers.extend(buffers)
-
-        if len(all_buffers) != len(kv_caches):
-            raise RuntimeError(
-                f"FlexKV DSv4 flattened {len(all_buffers)} buffers, expected "
-                f"{len(kv_caches)}"
-            )
-
-        # The primary layout owns the full PP-stage layer-id namespace. Group
-        # layouts remain local because several groups cover disjoint layer sets.
-        first_layout = gpu_layouts[0]
-        primary_layout = KVCacheLayout(
-            type=first_layout.type,
-            num_layer=self.rank_info.num_layers_per_pp_stage,
-            num_block=first_layout.num_block,
-            tokens_per_block=first_layout.tokens_per_block,
-            num_head=first_layout.num_head,
-            head_size=first_layout.head_size,
-            kv_dim=first_layout.kv_dim,
-            num_kv_heads=first_layout.num_kv_heads,
-        )
-
+    def _build_dsv4_swa_registration(self):
+        """SWA GPU pool geometry for DSv4: (caches, layout, layer_groups,
+        gpu_layouts, handles_per_group), all None when the model has no SWA
+        pool. Shared by the GPU registration and by the radixshmem bootstrap,
+        which must know the sidecar groups before the TE sees a registration."""
         swa_caches = None
         swa_layout = None
         swa_layer_groups = None
@@ -2351,6 +2292,88 @@ class FlexKVConnector:
                     swa_handles_per_group.append(list(state_buffers))
                     swa_caches.extend(state_buffers)
 
+        return (swa_caches, swa_layout, swa_layer_groups, swa_gpu_layouts,
+                swa_handles_per_group)
+
+    def _register_dsv4_to_server(self, kv_caches: List[torch.Tensor]) -> None:
+        """Register DSv4 main KV groups plus SWA/state sidecars."""
+        layer_groups: List[LayerGroupSpec] = []
+        gpu_layouts: List[KVCacheLayout] = []
+        handles_per_group: List[List[torch.Tensor]] = []
+        all_buffers: List[torch.Tensor] = []
+
+        for group in self._dsv4_layer_groups:
+            buffers = group["buffers"]
+            sample = buffers[0]
+            if sample.ndim != 2:
+                raise RuntimeError(
+                    f"FlexKV DSv4 group {group['name']!r} expects 2D page "
+                    f"buffers, got shape={tuple(sample.shape)}"
+                )
+            if any(buf.shape != sample.shape for buf in buffers):
+                raise RuntimeError(
+                    f"FlexKV DSv4 group {group['name']!r} has mixed shapes"
+                )
+            sub_page_size = int(group["sub_page_size"])
+            if self.page_size % int(group["ratio"]) != 0:
+                raise RuntimeError(
+                    f"FlexKV page_size={self.page_size} is not divisible by "
+                    f"DSv4 ratio={group['ratio']}"
+                )
+            if sample.shape[1] % sub_page_size != 0:
+                raise RuntimeError(
+                    f"FlexKV DSv4 group {group['name']!r} page stride "
+                    f"{sample.shape[1]} is not divisible by {sub_page_size}"
+                )
+            head_size = sample.shape[1] // sub_page_size
+            layer_groups.append(
+                LayerGroupSpec(
+                    num_layers=len(group["layer_ids"]),
+                    num_kv_heads=1,
+                    head_size=head_size,
+                    layer_indices=list(group["layer_ids"]),
+                    compress_ratio=int(group["ratio"]),
+                    dtype=group["dtype"],
+                )
+            )
+            gpu_layouts.append(
+                KVCacheLayout(
+                    type=KVCacheLayoutType.LAYERFIRST,
+                    num_layer=len(group["layer_ids"]),
+                    num_block=sample.shape[0],
+                    tokens_per_block=sub_page_size,
+                    num_head=1,
+                    head_size=head_size,
+                    kv_dim=self.model_config.kv_dim,
+                    num_kv_heads=self.model_config.num_kv_heads,
+                )
+            )
+            handles_per_group.append(list(buffers))
+            all_buffers.extend(buffers)
+
+        if len(all_buffers) != len(kv_caches):
+            raise RuntimeError(
+                f"FlexKV DSv4 flattened {len(all_buffers)} buffers, expected "
+                f"{len(kv_caches)}"
+            )
+
+        # The primary layout owns the full PP-stage layer-id namespace. Group
+        # layouts remain local because several groups cover disjoint layer sets.
+        first_layout = gpu_layouts[0]
+        primary_layout = KVCacheLayout(
+            type=first_layout.type,
+            num_layer=self.rank_info.num_layers_per_pp_stage,
+            num_block=first_layout.num_block,
+            tokens_per_block=first_layout.tokens_per_block,
+            num_head=first_layout.num_head,
+            head_size=first_layout.head_size,
+            kv_dim=first_layout.kv_dim,
+            num_kv_heads=first_layout.num_kv_heads,
+        )
+
+        (swa_caches, swa_layout, swa_layer_groups, swa_gpu_layouts,
+         swa_handles_per_group) = self._build_dsv4_swa_registration()
+
         self.tp_client.register_to_server(
             kv_caches=all_buffers,
             kv_layout=primary_layout,
@@ -2366,7 +2389,7 @@ class FlexKVConnector:
         logger.info(
             "[FlexKV-DSv4] registered %d main groups, SWA=%s, state_groups=%d",
             len(layer_groups),
-            bool(swa_buffers),
+            swa_caches is not None,
             len(self._dsv4_state_groups),
         )
 

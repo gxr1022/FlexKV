@@ -262,6 +262,14 @@ def _external_prefetch_proc(server_id, dp_size, ssd_dir, ready_evt, wrote_evt,
 
 
 def main() -> int:
+    # The external controller warms CPU from the SSD tier. radixshmem mode is
+    # CPU-tier only since the CPU pool moved into the radix-server's SlotStore,
+    # so there is no source tier for it to read; peer blocks are pulled by
+    # KVManager.prefetch_async (RadixClient.get_async) instead.
+    print("SKIP: PrefetchController needs the SSD tier, which radixshmem mode no "
+          "longer has (CPU tier only); see docs/radixshmem_cross_node.md")
+    return 0
+
     if not torch.cuda.is_available():
         print("SKIP: need a CUDA device")
         return 0

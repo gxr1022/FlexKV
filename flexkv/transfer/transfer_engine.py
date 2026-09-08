@@ -731,8 +731,13 @@ class TransferEngine:
 
             self._worker_map[TransferType.LAYERWISE] = self.layerwise_workers
 
-        if self.cache_config.enable_kv_sharing and self._cpu_handle is not None and (self.cache_config.enable_p2p_cpu \
-            or (self._ssd_handle and self.cache_config.enable_p2p_ssd)):
+        # radixshmem mode: the CPU pool is the radix-server's SlotStore and peer
+        # blocks are pulled by that server (RadixClient.get_async from the CE's
+        # prefetch), so FlexKV runs no peer transfer worker of its own.
+        if (self.cache_config.enable_kv_sharing and self._cpu_handle is not None
+                and not GLOBAL_CONFIG_FROM_ENV.radix_shmem
+                and (self.cache_config.enable_p2p_cpu
+                     or (self._ssd_handle and self.cache_config.enable_p2p_ssd))):
             ## NOTE:if we have the cpu handle and enable p2p cpu transfer we need this worker
             ## (currently we inplement cpu and ssd distributed transfer in one worker)
 

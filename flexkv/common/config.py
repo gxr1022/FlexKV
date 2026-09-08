@@ -595,6 +595,10 @@ class SWAPoolConfig:
     multi_group: bool = False
     evict_ratio: float = 0.1           # Fraction of pool to evict when full
     pin_memory: bool = True            # Use pinned memory for async DMA
+    # Sidecar groups packed into one SWA page (DSv4 compress states). The TE
+    # learns them from the GPU registration; the radixshmem bootstrap needs them
+    # earlier to size the SWA slot, so the connector records them here.
+    layer_groups: Optional[List['LayerGroupSpec']] = None
 
     def for_ssd_tier(self) -> "SWAPoolConfig":
         """Derive the SSD-tier SWA config (same slot geometry, num_ssd_slots slots).
@@ -711,6 +715,9 @@ class CacheConfig:
     # Stored for deferred recomputation when layer_groups become known
     _user_cpu_cache_gb: float = 0
     _user_ssd_cache_gb: float = 0
+    # Layers one CPU block covers (this node's PP stage), recorded by the
+    # adapters' config resolution; 0 = derive num_layers // pp_size.
+    _num_layers_per_pp_stage: int = 0
 
     # SWA pool config (DeepSeek V4)
     swa: Optional['SWAPoolConfig'] = None
@@ -796,8 +803,39 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # both are set); a concrete per-node address, since it also derives the identity.
     radix_rpc_address=os.getenv('FLEXKV_RADIX_RPC_ADDRESS', ''),
     radix_rpc_interface=os.getenv('FLEXKV_RADIX_RPC_INTERFACE', ''),
-    radix_rdma_dev=os.getenv('FLEXKV_RADIX_RDMA_DEV', ''),
+    # HCA of the index control plane (radixshmem ClusterConfig.index_dev); the
+    # data plane's HCAs are FLEXKV_RADIX_TRANSFER_DEV (comma separated, empty =
+    # every device mooncake finds).
+    radix_index_dev=os.getenv('FLEXKV_RADIX_INDEX_DEV',
+                              os.getenv('FLEXKV_RADIX_RDMA_DEV', '')),
+    radix_transfer_devices=[d for d in
+                            os.getenv('FLEXKV_RADIX_TRANSFER_DEV', '').split(',') if d],
     radix_gid_idx=int(os.getenv('FLEXKV_RADIX_GID_IDX', 3)),
+    # etcd namespace (radix/<cluster_id>/...) and this node's identity; the
+    # SHMRADIX_* spellings are what radixshmem itself reads.
+    radix_cluster_id=os.getenv('FLEXKV_RADIX_CLUSTER_ID',
+                               os.getenv('SHMRADIX_CLUSTER_ID', 'default')),
+    radix_node_name=os.getenv('FLEXKV_RADIX_NODE_NAME',
+                              os.getenv('SHMRADIX_NODE_NAME', '')),
+    # RHT slots per bucket: 1 is a blind overwrite that defeats peer routing.
+    radix_rht_slots=int(os.getenv('FLEXKV_RADIX_RHT_SLOTS',
+                                  os.getenv('SHMRADIX_RHT_SLOTS', 4))),
+    # embedded: the bootstrap DP process launches the radix-server subprocess;
+    # external: a radix-server started by the operator is attached to.
+    radix_server_launch_mode=os.getenv('FLEXKV_RADIX_SERVER_LAUNCH_MODE', 'embedded').lower(),
+    # gRPC endpoint override; empty = unix:///dev/shm/<index name>.sock.
+    radix_endpoint=os.getenv('FLEXKV_RADIX_ENDPOINT', ''),
+    # MAP_POPULATE the SlotStore at server start (predictable D2H latency, pages
+    # placed by the server process's NUMA policy).
+    radix_prefault=bool(int(os.getenv('FLEXKV_RADIX_PREFAULT', 1))),
+    # Server-side deadline of one prefetch pull; the job completes with the local
+    # hit when it expires. sglang's FlexKV path has no prefetch timeout of its own.
+    radix_prefetch_timeout_ms=int(os.getenv('FLEXKV_RADIX_PREFETCH_TIMEOUT_MS', 5000)),
+    # Peer pulls in flight per CE process before new prefetches skip the peer
+    # walk (kept under radixshmem's max_outstanding so get_async never blocks).
+    radix_prefetch_max_inflight=int(os.getenv('FLEXKV_RADIX_PREFETCH_MAX_INFLIGHT', 128)),
+    # Index DataPool sizing factor (radixshmem IndexConfig.data_pool_ratio).
+    radix_data_pool_ratio=float(os.getenv('FLEXKV_RADIX_DATA_POOL_RATIO', 8.0)),
     radix_bootstrap_timeout_sec=int(os.getenv(
         'FLEXKV_RADIX_BOOTSTRAP_TIMEOUT_SEC', 120
     )),
@@ -1146,6 +1184,7 @@ def update_default_config_from_user_config(rank_info: RankInfo,
     # Store original GB values for deferred recomputation (when layer_groups become known)
     cache_config._user_cpu_cache_gb = user_config.cpu_cache_gb
     cache_config._user_ssd_cache_gb = user_config.ssd_cache_gb
+    cache_config._num_layers_per_pp_stage = int(rank_info.num_layers_per_pp_stage)
 
     cache_config.num_cpu_blocks = (
         convert_to_block_num(user_config.cpu_cache_gb, block_size_in_bytes)

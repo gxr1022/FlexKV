@@ -5,10 +5,10 @@
 FlexKV offload/reuse。从环境到启动到验证的一整套都在这里。
 
 > 和 [`radixshmem_cross_node.md`](radixshmem_cross_node.md) 的区别：那篇是
-> **跨节点 + vLLM**，要 etcd / RDMA / mooncake / Redis，并且明确写着 radixshmem
-> **不支持 SWA**。本文是**单机 + SGLang + SWA**：world_size=1，不需要
-> etcd/RDMA/mooncake/Redis 里的任何一个，而 radixshmem 后端在**本机范围内支持
-> SWA**（滑窗 KV 存到 CPU SWA pool，SWA-aware GET 从中恢复）。
+> **跨节点**，要 etcd / RDMA。本文是**单机 + SGLang + SWA**：world_size=1，不需要
+> etcd / RDMA，而 radixshmem 后端在**本机范围内支持 SWA**（滑窗 KV 存到 CPU SWA
+> pool，SWA-aware GET 从中恢复）。跨节点时 prefetch 的 `get_async` 也会把对端的 SWA
+> 窗口一并拉回本节点，随后的 SWA-aware GET 仍是本地查询。
 
 ---
 
@@ -39,8 +39,8 @@ SGLang（DSv4）
   all-or-none）。SWA 发布在 Full path 发布之后。
 - **GET（SWA-aware）**：一次 local-only 的 `FULL|SWA` joint 查询拿到共同命中，Full
   H2D + 一个 k-slot 的 is_swa H2D 进同一 transfer graph，窗口正好贴在恢复前缀的尾部。
-- 没有 etcd / RDMA / mooncake / Redis：`world_size=1` 时 region 名不带节点身份，
-  跨节点的整条 bootstrap 分支被完全跳过；SWA 匹配强制 local-only（跨节点 SWA 尚未支持）。
+- 没有 etcd / RDMA：`world_size=1` 时跨节点的整条 bootstrap 分支被完全跳过；`match`
+  永远是本地查询，对端块只经 prefetch（`get_async`）进入本地树。
 
 ---
 
@@ -141,8 +141,8 @@ MPS 只是让 FlexKV 的 transfer worker 进程和推理进程共享 GPU context
 
 `FLEXKV_RADIX_WORLD_SIZE` 默认 1（单机），因此**跨节点那套变量全都不用设**：
 `FLEXKV_RADIX_REGISTRY`（etcd）、`FLEXKV_RADIX_RPC_ADDRESS`/`_INTERFACE`、
-`FLEXKV_RADIX_RDMA_DEV`、`SHMRADIX_RHT_SLOTS`、`SHMRADIX_CLUSTER_ID` 等在
-world_size=1 时根本不会被读取。
+`FLEXKV_RADIX_INDEX_DEV`、`FLEXKV_RADIX_TRANSFER_DEV`、`FLEXKV_RADIX_RHT_SLOTS`、
+`FLEXKV_RADIX_CLUSTER_ID` 等在 world_size=1 时不起作用。
 
 SWA 相关（可选）：
 
@@ -173,8 +173,8 @@ cpu_cache_gb: 64
 - `ssd_cache_gb`：设成 **严格大于** `cpu_cache_gb` 即开 SSD spill 层（否则 CacheConfig 报错）；
   不用 SSD 就别写。SWA 窗口本身是 CPU-only（默认 `num_ssd_slots=0`）。
 - `kv_cache_dtype`：SGLang 用 `--kv-cache-dtype auto` 时 FlexKV 猜不出 dtype，在这里显式给。
-- `enable_p2p_cpu` / `enable_p2p_ssd`：**单机不要开**——它们是跨节点 peer 复用开关，会连带
-  拉起 Redis/Mooncake。单机 radixshmem 走本地树，两者保持默认 false。
+- `enable_p2p_cpu`：跨节点 peer 复用的 connector 侧开关（让 sglang 走 prefetch），单机保持默认
+  false；`enable_p2p_ssd` 和 `ssd_cache_gb > 0` 在 radixshmem 模式下不支持。
 
 > 关于 SWA pool 容量：`num_slots` 默认 1024，`window_blocks=1`（DSv4），1024 ≥ 1
 > 满足启动检查。启动时若 `num_slots < window_blocks` 会直接
@@ -376,16 +376,15 @@ SGLANG_DEBUG_ZERO_SWA_ON_FLUSH=1 ... python -m sglang.launch_server ...
 
 ## 5. 注意事项与限制
 
-- **仅单机**：radixshmem 的 SWA 匹配强制 local-only；跨节点 SWA 复用尚未支持
-  （`FULL|SWA` 且非 local-only 会 `ValueError`）。跨节点只对 Full KV 有效（那需要另一套
-  etcd/RDMA/mooncake 配置，见 `radixshmem_cross_node.md`）。
+- **匹配永远本地**：跨节点时对端的 Full 块和 SWA 窗口都由 prefetch（`get_async`）拉回本节点，
+  再由本地 SWA-aware GET 恢复（etcd/RDMA 配置见 `radixshmem_cross_node.md`）。
 - **SWA 只对 DSv4 自动开**：由 HF architectures 判定（`is_deepseek_v4_arch`）。
   其他滑窗模型（gpt-oss/gemma）在 SGLang 侧走的不是这条 DSv4 路径，本文不覆盖。
 - **窗口驱逐后不补发**（已接受的 MVP 限制）：某前缀的 Full 路径仍缓存、但其 SWA 窗口被
   SWA pool 独立 LRU 驱逐后，该前缀的重复 PUT 不会补发窗口，直到 Full 路径本身老化。期间该
   前缀的 SWA-aware GET 会 miss。
 - **不能和 `enable_remote`（第三方 PCFS 存储）同开**：`KVManager` 直接报错。
-- **不要开 `enable_p2p_cpu/ssd`**：那是跨节点开关，单机不需要，还会拉起 Redis/Mooncake。
+- **单机不要开 `enable_p2p_cpu`**：那是跨节点开关；`enable_p2p_ssd` 在 radixshmem 模式下不支持。
 - **c_ext `.so` 是全局的**：cu130 版会覆盖 cu128 版，多环境需各自重编或备份。
 - **MPS**：CUDA 前加 `CUDA_MPS_PIPE_DIRECTORY=/nonexistent/mps`，并 `FLEXKV_ENABLE_MPS=0`。
   杀任何 MPS 守护进程之前先停掉所有可能是它客户端的服务（`/proc/<pid>/fd` 看不出客户端关系），

@@ -109,7 +109,7 @@ class PrefetchController:
                  channel_id: int = -1,
                  enable_ssd: bool = True):
         from flexkv.cache.radix_shmem_engine import CacheEngineRadixShmem
-        from flexkv.server.shm_radix_bootstrap import shm_name_for
+        from flexkv.server.shm_radix_bootstrap import radix_index_name
 
         self.server_id = server_id
         self._ext_lock_fd: Optional[int] = None
@@ -182,14 +182,15 @@ class PrefetchController:
         self.cpu_engine = CacheEngineRadixShmem(
             device_type=DeviceType.CPU, num_total_blocks=0,
             tokens_per_block=-1,
-            shm_name=shm_name_for(DeviceType.CPU, self.server_id))
+            shm_name=radix_index_name(self.server_id))
         self.tokens_per_block = self.cpu_engine.tokens_per_block
         self.ssd_engine = None
         if enable_ssd:
-            self.ssd_engine = CacheEngineRadixShmem(
-                device_type=DeviceType.SSD, num_total_blocks=0,
-                tokens_per_block=-1,
-                shm_name=shm_name_for(DeviceType.SSD, self.server_id))
+            # radixshmem indexes the CPU tier only; a DISK2H prefetch has no
+            # source to read from in this mode.
+            raise NotImplementedError(
+                "PrefetchController: the radixshmem path has no SSD tier; "
+                "pass enable_ssd=False")
 
         # CE-side shm channel to the shared TE (created by the FlexKV bootstrap).
         # The handle attaches purely by (server_id, channel_id).
@@ -416,9 +417,8 @@ class PrefetchController:
         # would hand it slot ids out of somebody else's mempool. No SSD tier
         # stands in as an empty match, like `_match_radixshmem` does, so
         # everything below reads the pair without re-testing the tier.
-        cpu_m = self.cpu_engine.match(seq, with_peer=False)
-        ssd_m = (self.ssd_engine.match(seq, with_peer=False)
-                 if self.ssd_engine is not None else ShmRadixMatch())
+        cpu_m = self.cpu_engine.match(seq)
+        ssd_m = ShmRadixMatch()
 
         # match(lock=True) inc_ref'd each matched prefix; release() is the only
         # thing that drops those refs, and it must run on every path. It is

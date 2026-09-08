@@ -73,7 +73,19 @@ DP scheduler 进程 0   ...   DP scheduler 进程 N-1
   └──────────────────────────────────────────┘
 ```
 
-总进程数：`N (DP scheduler) + 1 (TE) + 1 (radix server，bootstrap 时由 DP-0 KVManager 启动 TreeServer，其余 DP attach 为 TreeClient)`。**KVServer 进程被完全去掉**。
+总进程数：`N (DP scheduler) + 1 (TE) + 1 (radix-server)`。**KVServer 进程被完全去掉**。
+
+radix-server 是 radixshmem 的 `RadixServer`：DP-0 的 KVManager 把它作为子进程拉起
+（`FLEXKV_RADIX_SERVER_LAUNCH_MODE=embedded`，默认），或者由运维预先起好（`external`）。它拥有三样东西：
+
+- radix 索引 shm（`/dev/shm/shmradix_<id>_cpu`）；
+- SlotStore shm（`/dev/shm/shmradix_<id>_cpu_data`）：**这就是 FlexKV 的 CPU KV 池**，一个 slot 一个 block，
+  slot id 就是 block 下标。FlexKV 不再自己 `torch.empty` 一块 CPU buffer 再用 `TensorSharedHandle`
+  传给 worker；TE 和每个 transfer worker 按名字 attach 这块 SlotStore，把池当成普通 tensor 做 H2D/D2H；
+- 跨节点时的 mooncake 传输引擎和 etcd 登记（见 `radixshmem_cross_node.md`）。
+
+所有 DP 进程用 `shmradix.RadixClient(name)` 挂载它：索引操作（query / insert / allocate_slots）直接走 shm，
+gRPC（`/dev/shm/shmradix_<id>_cpu.sock`）只在挂载握手和跨节点拉取时用到。
 
 跟原架构的对比：
 
@@ -169,7 +181,20 @@ export FLEXKV_DP_SIZE=8                    # 必须跟 vllm --data-parallel-size
 export FLEXKV_CPU_CACHE_GB=200             # CPU cache 大小，见 §6.1
 ```
 
-`FLEXKV_RADIX_SHMEM=1` 时 `KVManager` 走 `use_radix_shmem=True` 分支，每个 DP 进程内部构造 `KVTaskEngine`，绕过 `KVServer.create_server()`。Bootstrap DP（`instance_id=0 && dp_client_id=0`）顺带创建 shm radix regions（CPU/SSD/REMOTE 三段，按需）；其它 DP attach。
+`FLEXKV_RADIX_SHMEM=1` 时 `KVManager` 走 `use_radix_shmem=True` 分支，每个 DP 进程内部构造 `KVTaskEngine`，绕过 `KVServer.create_server()`。Bootstrap DP（`instance_id=0 && dp_client_id=0`）拉起本节点的 radix-server 子进程（索引 + SlotStore = CPU 池）并 spawn 共享 TE；其它 DP attach。
+
+radixshmem 模式只有 CPU 层：`ssd_cache_gb` 必须为 0，`enable_remote` 不能开。
+
+radix-server 相关的可选项（都有默认值）：
+
+```bash
+export FLEXKV_RADIX_SERVER_LAUNCH_MODE=embedded   # embedded：DP-0 拉起子进程；external：挂载运维预先起好的 radix-server
+export FLEXKV_RADIX_ENDPOINT=                     # radix-server gRPC 端点，空 = unix:///dev/shm/shmradix_<id>_cpu.sock
+export FLEXKV_RADIX_PREFAULT=1                    # 启动时预触 SlotStore 所有页（D2H 首次不再缺页；启动多花几十秒）
+export FLEXKV_RADIX_DATA_POOL_RATIO=8             # 索引 DataPool 大小系数
+```
+
+跨节点（`FLEXKV_RADIX_WORLD_SIZE > 1`）的变量见 `radixshmem_cross_node.md`。
 
 ### 4.2 vllm 启动参数
 
@@ -289,6 +314,8 @@ python3 benchmarks/two_phase/analyze_three_way.py \
 ## 6. 高压力测试结果
 
 测试环境：H20 单机 8 × GPU，2 TB RAM，容器 `--shm-size=400g`。Qwen3-8B（36 layers / 8 KV heads / head_dim=128 / bf16）。
+
+> 以下数据在 CPU 池还由 FlexKV 自己分配时测得；换成 radix-server 的 SlotStore 后 H2D/D2H 的地址和步长完全相同，只是内存的拥有者变了。
 
 ### 6.1 容量账（先把数算清楚）
 
@@ -460,6 +487,8 @@ verifier 跑五项垃圾检查：replacement char、控制字符、低熵、priv
 | 6. vllm 不把所有 env 传给 engine 子进程 | 自定义 `FLEXKV_*` env 在 engine 进程里 `os.getenv` 拿不到 | env 的 default 行为只继承一部分；FlexKV 已用 `FlexKVConfig.from_env` 序列化进 config；若新加 env 需要 lazy resolve |
 | 7. `--shm-size` 一旦设定，container restart 不能改 | 修不了 | `docker rm` 重建 |
 | 8. `FLEXKV_SHM_RADIX_ID` 重复 | 多个 vllm 实例 attach 同一段 shm tree，状态串了 | 每个实例用唯一 ID |
+| 8b. `/dev/shm` 容量 | CPU KV 池整体是 radix-server 建在 `/dev/shm` 的 SlotStore：容器 `--shm-size` 小于 `cpu_cache_gb` 时 radix-server 起不来 | `--shm-size` ≥ `cpu_cache_gb` + 余量；或 `use_hugepage_cpu_buffer: true` + `FLEXKV_HUGETLBFS_DIR` 走 hugetlbfs |
+| 8c. `attached radixshmem regions do not match FlexKV's configuration` | TE 算出的 CPU 块字节数 / 块数与 DP-0 启动 radix-server 时不同 | 日志里有两边的数值；多 PP 不均分或 DSv4 sidecar 组没在 KVManager 之前记录时会出现 |
 | 9. CPU cache 跨 DP 共享、但 GPU KV cache 是 per-DP | 容易混淆容量估算 | 见 §6.1，CPU 是 200 GB 共池，GPU 是 8 × 24 GB 独立 |
 | 10. `flexkv/transfer/worker.py` 里曾在 `_transfer_impl` 后 `torch.cuda.synchronize()` | 把 D2H/H2D op 串行成 device-wide drain，R2 mean / p95 / p99 各 ~10-12% degrade | device-wide sync 已移除；`GPUCPUTransferWorker._transfer_impl` 现把 `sync=True` 下推给 C++ `transfer_kv_blocks`，收尾只做 stream-scoped 的 `cudaStreamSynchronize(stream)`（`csrc/transfer.cu:300`），不再 drain 整个 device。下游 worker 队列自带 stream-aware 排序，多余的 device sync 没有保护任何 invariant。NIXL worker 的 sync（`worker.py:2411`，由 PR #142 引入）属于另一条路径，与本项无关 |
 

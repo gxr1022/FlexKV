@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
+# NOTE: this script drives the PRE-DATA-PLANE cross-node path (FlexKV's own
+# PEER2CPU worker over mooncake + a Redis address book, CPU + SSD tiers). Since
+# the radixshmem data-plane integration the CPU pool is the radix-server's
+# SlotStore, peer blocks are pulled by `RadixClient.get_async` from the prefetch
+# path, there is no Redis / mooncake config on the FlexKV side, and the SSD tier
+# is not available in radixshmem mode. The maintained cross-node check is
+# tests/test_e2e_radix_prefetch_p2p.py (see docs/radixshmem_cross_node.md §4).
+#
 # FlexKV × radixshmem: CROSS-NODE KV reuse test (doc radixshmem_cross_node.md §4.1),
 # driven through vLLM.
 #
