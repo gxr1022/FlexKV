@@ -12,13 +12,17 @@ NEW = 128
 # must be the same directory the server was started with (SGLANG_DEBUG_SWA_DUMP_DIR=<dir>)
 DUMP = os.environ.get("SGLANG_DEBUG_SWA_DUMP_DIR") or sys.exit("set SGLANG_DEBUG_SWA_DUMP_DIR to the server's dump dir")
 N=int(sys.argv[1]) if len(sys.argv)>1 else 12
+# Optional DP-rank pinning for dp>1 servers (see kl_tf_aligned.py). The dump hook names files by TP
+# rank only, so with dp>1 the scoring requests must be pinned to ONE dp rank to avoid collisions.
+_r = lambda k: (int(os.environ[k]) if os.environ.get(k) not in (None, "") else None)
+GEN_RANK, SCORE_RANK = _r("SWA_VERIFY_GEN_DP_RANK"), _r("SWA_VERIFY_SCORE_DP_RANK")
 def flush():
     for _ in range(30):
         try: _flush_cache(BASE); return
         except Exception: time.sleep(1)
 def det(r): d=r["meta_info"].get("cached_tokens_details") or {}; return d.get("host",0), d.get("device",0)
-def score(seq, start):
-    r=_generate(BASE,[seq],0,return_logprob=True,logprob_start_len=start)[0]; return det(r)
+def score(seq, start, rank=None):
+    r=_generate(BASE,[seq],0,return_logprob=True,logprob_start_len=start,routed_dp_rank=rank)[0]; return det(r)
 def dumps_since(t0):
     fs=[f for f in glob.glob(f"{DUMP}/*.pt") if os.path.getmtime(f)>=t0]
     time.sleep(1.0)  # let all ranks finish writing
@@ -31,11 +35,13 @@ if FRESH:  # prepend 256 random tokens (drawn from the prompt itself) so the pat
     ids=[[rng.choice(p) for _ in range(256)]+p for p in ids]
 rows=[]; t_all=time.time()
 for i,p in enumerate(ids):
-    cont=_generate(BASE,[p],NEW)[0]["output_ids"][:NEW]; seq=p+cont; L=len(p)
-    t0=time.time()-0.01; cd0=score(seq,L); before=dumps_since(t0)          # device hit -> dump BEFORE
+    cont=_generate(BASE,[p],NEW,routed_dp_rank=GEN_RANK)[0]["output_ids"][:NEW]; seq=p+cont; L=len(p)
+    # BEFORE must be a device hit on the rank that stored (GEN_RANK); the host restore and AFTER go to
+    # SCORE_RANK, so with dp>1 the compared page crosses ranks (GEN_RANK's GPU page vs SCORE_RANK's restore).
+    t0=time.time()-0.01; cd0=score(seq,L,GEN_RANK); before=dumps_since(t0)          # device hit -> dump BEFORE
     flush(); time.sleep(0.5)
-    ch=score(seq,L)                                                        # host restore (no dump)
-    t1=time.time()-0.01; cd1=score(seq,L); after=dumps_since(t1)           # device hit -> dump AFTER
+    ch=score(seq,L,SCORE_RANK)                                                      # host restore (no dump)
+    t1=time.time()-0.01; cd1=score(seq,L,SCORE_RANK); after=dumps_since(t1)         # device hit -> dump AFTER
     B={torch.load(f)["rank"]:torch.load(f) for f in before}; A={torch.load(f)["rank"]:torch.load(f) for f in after}
     ranks=sorted(set(B)&set(A)); eq_layers=0; tot=0; keys_match=all(B[r]["key"]==A[r]["key"] for r in ranks)
     per_rank=[]; nr=len(ranks)

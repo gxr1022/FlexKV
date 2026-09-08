@@ -11,6 +11,7 @@ venv 与 sglang 的 `sglang.test.kl_test_utils`；LongBench-v2 首次下载需 `
 | `SGLANG_BASE_URL` | 服务地址，默认 `http://127.0.0.1:30000` |
 | `SGLANG_DEBUG_SWA_DUMP_DIR` | `swa_bytes_compare.py` 必填，须与服务启动时的同名变量一致 |
 | `FRESH` | `swa_bytes_compare.py`，默认 1：给 prompt 加 256 随机 token 前缀保证未存过 |
+| `SWA_VERIFY_GEN_DP_RANK` / `SWA_VERIFY_SCORE_DP_RANK` | 可选，dp>1 服务用：生成（即 store）钉到前者，三次打分（host 恢复、device 命中 ×2）钉到后者，host 恢复即为跨 rank 恢复；`swa_bytes_compare.py` 的 BEFORE dump 取自前者的 device 命中。不设则由服务路由 |
 
 运行日志（`*.log`）不入库。
 
