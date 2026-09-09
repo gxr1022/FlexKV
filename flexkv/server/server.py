@@ -253,8 +253,11 @@ class KVServer:
                 # Always propagate FLEXKV_* env vars to child process so that
                 # runtime config overrides (e.g. FLEXKV_REBUILD_INTERVAL_MS)
                 # are visible when config.py is re-imported in the subprocess.
+                # CUDA_* must follow too: dropping CUDA_MPS_PIPE_DIRECTORY makes the
+                # server's transfer workers attach to the host's default MPS daemon
+                # (cudaGetDeviceCount error 805) instead of the parent's bypass.
                 for key, val in os.environ.items():
-                    if key.startswith("FLEXKV_") and key not in env:
+                    if key.startswith(("FLEXKV_", "CUDA_")) and key not in env:
                         env[key] = val
 
             cvd = os.environ.get('CUDA_VISIBLE_DEVICES')
