@@ -100,6 +100,7 @@ class TransferManagerShmChannelHandle:
             message="TransferManagerShmChannelHandle.submit", color="green"
         )
         self._channel.submit_send(_SubmitMsg(transfer_graph, task_end_op_id))
+        self._ctrl.notify()  # wake the TE: an idle _poll_submits parks on the ctrl futex for up to 100 ms
         nvtx.end_range(nvtx_range)
 
     def submit_batch(self, transfer_graphs: List[TransferOpGraph]) -> None:
@@ -108,6 +109,8 @@ class TransferManagerShmChannelHandle:
         # benchmarks show it matters.
         for g in transfer_graphs:
             self._channel.submit_send(_SubmitMsg(g, -1, is_batch=True))
+        if transfer_graphs:
+            self._ctrl.notify()   # see submit()
 
     def wait(self, timeout: Optional[float] = None) -> List[CompletedOp]:
         if timeout is None:
