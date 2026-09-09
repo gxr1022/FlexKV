@@ -515,6 +515,12 @@ class FlexKVConfig:
             if GLOBAL_CONFIG_FROM_ENV.radix_shmem \
             else None
 
+        if dp_rank is None and GLOBAL_CONFIG_FROM_ENV.radix_shmem and sglang_dp_size > 1:
+            # Every DP process would derive dp_client_id 0: the same radix-server
+            # bootstrap ownership, TE channel and graph/op id range.
+            raise ValueError(
+                "[FlexKV SGLang] radix_shmem with dp_size > 1 needs the scheduler's "
+                "dp_rank; got None")
         dp_rank = 0 if dp_rank is None else int(dp_rank)
         cp_rank = 0 if cp_rank is None else int(cp_rank)
         if local_dp_size is not None:

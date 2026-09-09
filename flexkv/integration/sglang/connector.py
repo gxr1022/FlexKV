@@ -165,7 +165,7 @@ class FlexKVConnector:
             page_size=self.page_size,
             tp_rank=tp_rank,
             pp_rank=pp_rank,
-            dp_rank=dp_rank if dp_rank is not None else 0,
+            dp_rank=dp_rank,  # None is resolved (or rejected) by the config
             attn_cp_rank=attn_cp_rank,
         )
         self.model_config = self.flexkv_config.model_config
