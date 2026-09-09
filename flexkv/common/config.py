@@ -185,6 +185,9 @@ class ModelConfig:
     # and token_size_in_bytes/num_cpu_blocks are computed by summing across groups.
     layer_groups: Optional[List[LayerGroupSpec]] = None
 
+    # Optional SGLang DP-Attention override used only by the radix-shmem path.
+    local_dp_size: Optional[int] = None
+
     # ------------------------------------------------------------------
     # Freeze mechanism: after post_init, ModelConfig must not be mutated
     # ------------------------------------------------------------------
@@ -207,6 +210,24 @@ class ModelConfig:
                 f"[ModelConfig] cannot derive gpus_per_node: "
                 f"total_gpus={self.total_gpus} not divisible by nnodes={self.nnodes}"
             )
+        if self.local_dp_size is not None:
+            if self.local_dp_size < 1:
+                raise ValueError(
+                    "[ModelConfig] local_dp_size must be >= 1, got "
+                    f"{self.local_dp_size}"
+                )
+            if not self.enable_dp_attention or self.pp_size != 1:
+                raise ValueError(
+                    "[ModelConfig] local_dp_size is only supported for "
+                    "SGLang DP Attention with pp_size=1"
+                )
+            if self.nnodes * self.local_dp_size != self.dp_size:
+                raise ValueError(
+                    "[ModelConfig] node-local DP requires every DP group to "
+                    "reside on exactly one node, but "
+                    f"nnodes={self.nnodes} * local_dp_size={self.local_dp_size} "
+                    f"!= dp_size={self.dp_size}"
+                )
         if self.nnodes_per_pp_rank > 2:
             raise ValueError(
                 f"[ModelConfig] only support 2-nodes TP for now, but got "
@@ -492,6 +513,14 @@ class RankInfo:
         needed.
         """
         return self.instance_id * self.model_config.dp_size + self.dp_rank
+
+    @property
+    def local_dp_client_id(self) -> int:
+        """Dense per-instance, node-local id used for shared-memory IPC."""
+        local_dp_size = self.model_config.local_dp_size
+        if local_dp_size is None:
+            return self.dp_client_id
+        return self.dp_rank % local_dp_size
 
     @property
     def attn_tp_rank(self) -> int:

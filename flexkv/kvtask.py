@@ -225,7 +225,9 @@ class KVTaskManager:
             ]
             self.transfer_handles[0]._handle.send_config_to_remotes()
 
-        if self.model_config.nnodes > 1:
+        # A node-local shm TE replaces the legacy cross-node remote manager.
+        needs_remote_transfer_manager = self.model_config.local_dp_size is None
+        if self.model_config.nnodes > 1 and needs_remote_transfer_manager:
             self.transfer_handles.append(TransferManagerHandle(
                 model_config,
                 cache_config,

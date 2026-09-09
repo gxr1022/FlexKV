@@ -159,6 +159,32 @@ class FlexKVConfig:
         if self.gpu_register_port == "":
             self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
+    @staticmethod
+    def get_sglang_node_local_dp_size(
+        server_args: object,
+    ) -> Optional[int]:
+        """Return a safe node-local DP width for SGLang DP Attention.
+
+        SGLang validates the composite TP/CP dimensions and assigns contiguous
+        DP groups. With ``pp_size == 1``, groups are node-local exactly when
+        ``dp_size`` is evenly divisible by ``nnodes``.
+
+        ``None`` keeps the existing cross-node TP/PP topology unchanged.
+        """
+        dp_size = max(1, int(getattr(server_args, "dp_size", 1) or 1))
+        pp_size = max(1, int(getattr(server_args, "pp_size", 1)))
+        nnodes = max(1, int(getattr(server_args, "nnodes", 1)))
+
+        if (
+            not bool(getattr(server_args, "enable_dp_attention", False))
+            or dp_size == 1
+            or nnodes == 1
+            or pp_size != 1
+            or dp_size % nnodes != 0
+        ):
+            return None
+        return dp_size // nnodes
+
     def _resolve_dtype(
         self,
         framework_dtype_str: Optional[str],
@@ -485,9 +511,30 @@ class FlexKVConfig:
         enable_dp_attention = bool(server_args.enable_dp_attention)
         attn_cp_size = int(getattr(server_args, 'attn_cp_size', 1))
         kv_cache_dtype = getattr(server_args, 'kv_cache_dtype', None)
+        local_dp_size = self.get_sglang_node_local_dp_size(server_args) \
+            if GLOBAL_CONFIG_FROM_ENV.radix_shmem \
+            else None
 
         dp_rank = 0 if dp_rank is None else int(dp_rank)
         cp_rank = 0 if cp_rank is None else int(cp_rank)
+        if local_dp_size is not None:
+            logger.info(
+                "[FlexKV SGLang] Enabling node-local radix-shmem DP: "
+                "global_dp_size=%d, local_dp_size=%d, node_rank=%d",
+                sglang_dp_size,
+                local_dp_size,
+                int(node_rank),
+            )
+        elif (
+            GLOBAL_CONFIG_FROM_ENV.radix_shmem
+            and enable_dp_attention
+            and sglang_dp_size > 1
+            and int(nnodes) > 1
+        ):
+            logger.warning(
+                "[FlexKV SGLang] Node-local radix-shmem DP is not enabled for "
+                "this DP/PP placement; preserving the legacy cross-node path."
+            )
 
         attn_dp_size = sglang_dp_size if enable_dp_attention else 1
         attn_tp_size = max(1, sglang_tp_size // (attn_dp_size * attn_cp_size))
@@ -602,6 +649,7 @@ class FlexKVConfig:
             pp_end_layer = self.model_config.num_layers
         self.model_config.enable_dp_attention = bool(enable_dp_attention)
         self.model_config.nnodes = max(1, int(nnodes))
+        self.model_config.local_dp_size = local_dp_size
         _dist_init_addr = getattr(server_args, 'dist_init_addr', None)
         if _dist_init_addr and int(nnodes) > 1:
             self.model_config.master_host = _dist_init_addr.split(":")[0]

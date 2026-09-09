@@ -39,7 +39,8 @@ class KVManager:
                  dp_client_id: int = 0,
                  server_recv_port: str = "",
                  gpu_register_port: str = "",
-                 event_collector: Optional[KVEventCollector] = None):
+                 event_collector: Optional[KVEventCollector] = None,
+                 local_dp_client_id: Optional[int] = None):
         # Use the curated ``__str__`` summaries. Dataclass repr includes
         # credential-bearing fields such as ``redis_password``.
         flexkv_logger.info(
@@ -111,8 +112,15 @@ class KVManager:
                 "FLEXKV_SERVER_LAUNCH_MODE=external requires server-client mode"
             )
 
+        self.dp_client_id = dp_client_id
+        self.local_dp_client_id = (
+            dp_client_id if local_dp_client_id is None else local_dp_client_id
+        )
+
         flexkv_logger.info(
             f"[KVManager] instance_num={model_config.instance_num}, dp_size={model_config.dp_size}, "
+            f"dp_client_id={self.dp_client_id}, "
+            f"local_dp_client_id={self.local_dp_client_id}, "
             f"server_client_mode={self.server_client_mode}, "
             f"server_launch_mode={self.server_launch_mode}, "
             f"use_radix_shmem={self.use_radix_shmem}"
@@ -121,10 +129,6 @@ class KVManager:
         self.redis_meta_client = None
         self.enable_mps = GLOBAL_CONFIG_FROM_ENV.enable_mps
         self.owns_mps = self.enable_mps and self.server_launch_mode != "external"
-        # Flat, instance-wide unique DP label (instance_id * dp_size + dp_rank),
-        # so it doubles as the radix-shmem path's per-CE id: disjoint graph/op id
-        # ranges and TE channel number.
-        self.dp_client_id = dp_client_id
         # The embedded radix-server subprocess — only the bootstrap process
         # holds this; others have None.
         self._shm_radix_server = None
@@ -180,9 +184,10 @@ class KVManager:
                                event_collector: Optional[KVEventCollector]) -> None:
         """Initialize the radix-shmem multi-DP path.
 
-        Everything shared by the DP processes of this node — the radix shm
-        regions and the single TE subprocess — is set up by the bootstrap proc
-        (dp 0) only. Every other proc just builds its own KVTaskEngine and
+        Everything shared by this inference instance's DP processes on the
+        node — the radix shm regions and the single TE subprocess — is set up
+        by the node-local bootstrap proc (local DP client 0) only. Every other
+        proc builds its own KVTaskEngine and
         attaches: `CacheEngineRadixShmem` polls for its region, and the TE
         channel handle blocks in `ShmControlBlock.wait_ready`.
 
@@ -197,7 +202,7 @@ class KVManager:
                                    (self.dp_client_id + 1) << 32)
 
         try:
-            if self.dp_client_id == 0:
+            if self.local_dp_client_id == 0:
                 self._bootstrap_radix_shmem()
 
             # GlobalCacheEngine reads GLOBAL_CONFIG_FROM_ENV.radix_shmem and
@@ -208,7 +213,7 @@ class KVManager:
                 redis_meta=self.redis_meta_client,
                 event_collector=event_collector,
                 shm_te_server_id=self._shm_radix_id,
-                shm_te_channel_id=self.dp_client_id,
+                shm_te_channel_id=self.local_dp_client_id,
             )
         except BaseException:
             # A failure after the TE / radix-server subprocesses were spawned
@@ -261,12 +266,14 @@ class KVManager:
                 f"{get_radixshmem_config().endpoint or radix_socket_path(self._shm_radix_id)}"
             )
 
-        # One shm channel per DP client (instance_num * dp_size).
+        total_clients = self.model_config.total_clients
+        if self.model_config.local_dp_size is not None:
+            total_clients = self.model_config.local_dp_size
         self._shm_te_process = TransferManagerShmTEProcess(
             self.model_config, self.cache_config,
             gpu_register_port=self.gpu_register_port,
             server_id=self._shm_radix_id,
-            num_channels=self.model_config.total_clients,
+            num_channels=total_clients,
         )
         self._shm_te_process.start()
 

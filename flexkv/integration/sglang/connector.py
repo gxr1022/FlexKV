@@ -235,8 +235,10 @@ class FlexKVConnector:
         # TransferManagerOnRemote process (FlexKV side) before any rank
         # on that node can register GPU buffers.
         self._remote_process = None
+        needs_remote_transfer_manager = self.model_config.local_dp_size is None
         if (
-            self.model_config.nnodes > 1
+            needs_remote_transfer_manager
+            and self.model_config.nnodes > 1
             and self.rank_info.node_rank > 0
             and self.rank_info.local_rank == 0
         ):
@@ -257,6 +259,7 @@ class FlexKVConnector:
                 model_config=self.model_config,
                 cache_config=self.cache_config,
                 dp_client_id=self.rank_info.dp_client_id,
+                local_dp_client_id=self.rank_info.local_dp_client_id,
                 server_recv_port=self.flexkv_config.server_recv_port,
                 gpu_register_port=self.flexkv_config.gpu_register_port,
             )
