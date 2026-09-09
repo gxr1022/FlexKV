@@ -123,7 +123,6 @@ def _node_proc(rank, gpu_id, cluster_id, config_path,
         "FLEXKV_RADIX_RPC_ADDRESS": "127.0.0.1",
         "FLEXKV_ENABLE_MPS": "0",
         "FLEXKV_SERVER_RECV_PORT": recv_port,
-        "FLEXKV_TRACE_RADIX_PEER": "1",
     })
 
     from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV, ModelConfig

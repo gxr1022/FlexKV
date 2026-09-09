@@ -99,7 +99,7 @@ ShmRadixMatch = _engine_mod.ShmRadixMatch
 from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV  # noqa: E402
 from flexkv.common.radixshmem_config import (  # noqa: E402
     RadixShmemConfigError, load_radixshmem_config, set_radixshmem_config)
-from flexkv.common.transfer import DeviceType, TransferType  # noqa: E402
+from flexkv.common.transfer import TransferType  # noqa: E402
 from flexkv.server import shm_radix_bootstrap as bootstrap  # noqa: E402
 
 FULL = shmradix.ComponentType.FULL
@@ -171,7 +171,7 @@ class _Env:
         return server
 
     def engine(self, name: str, **kwargs) -> CacheEngineRadixShmem:
-        engine = CacheEngineRadixShmem(device_type=DeviceType.CPU, shm_name=name, **kwargs)
+        engine = CacheEngineRadixShmem(name, **kwargs)
         self._stack.append(engine.close)
         return engine
 
@@ -227,12 +227,12 @@ def test_take_insert_match_recycle(env):
     # Match should now hit all 4 blocks, all of them this node's slots.
     r2 = engine.match(seq)
     assert r2.num_matched_blocks == 4
-    assert r2.num_local_blocks == 4
+    assert r2.local_slots.size == 4
     np.testing.assert_array_equal(np.sort(r2.local_slots), np.sort(slots))
     r2.release()
 
     # Recycle a fresh allocation; tree-attached slots are not affected.
-    free_slots = engine.take(num_required_blocks=2, strict=False)
+    free_slots = engine.take(num_required_blocks=2)
     engine.recycle(free_slots)
 
 
@@ -294,7 +294,7 @@ def test_eviction_reclaims_inserted(env):
     published.release()
     assert engine.num_free_blocks == 500
     # Allocate enough new blocks that eviction is forced (need > current free 500).
-    s2 = engine.take(num_required_blocks=1500, strict=False)
+    s2 = engine.take(num_required_blocks=1500)
     assert len(s2) > 500
 
 
@@ -308,11 +308,11 @@ def test_pinned_match_survives_eviction_pressure(env):
     pinned = engine.match(seq)
     assert pinned.num_matched_blocks == 1500
     # 500 free; everything else is pinned, so the take comes up short.
-    short = engine.take(num_required_blocks=1500, strict=False)
+    short = engine.take(num_required_blocks=1500)
     assert len(short) == 500
     engine.recycle(short)
     pinned.release()
-    evicting = engine.take(num_required_blocks=1500, strict=False)
+    evicting = engine.take(num_required_blocks=1500)
     assert len(evicting) == 1500
     engine.recycle(evicting)
 
@@ -326,7 +326,7 @@ def test_standalone_region_has_no_peer(env):
 
     assert engine.is_distributed is False
     assert engine.peer_enabled is False            # asked for, but world_size == 1
-    assert engine.cluster_rank == 0
+    assert bootstrap.radix_cluster_rank(engine.client) == 0
     assert engine.prefetch(seq) is None
     result = engine.match(seq)
     assert result.num_matched_blocks == 3
@@ -393,7 +393,7 @@ def _publish_full(engine, seq, num_blocks: int) -> np.ndarray:
 def _publish_swa(engine, seq, path_end: int,
                  window_blocks: int = SWA_W) -> np.ndarray:
     k = min(path_end, window_blocks)
-    slots = engine.take(k, strict=False, component=_SWA)
+    slots = engine.take(k, component=_SWA)
     assert len(slots) == k, "SWA pool unexpectedly short in test setup"
     engine.insert(seq, slots, num_insert_blocks=path_end, component=_SWA)
     return slots
@@ -421,7 +421,7 @@ def test_swa_window_invisible_until_published_then_joint_hit(env):
 
     match = engine.match(seq, component_mask=JOINT_MASK)
     assert match.num_matched_blocks == 20           # joint common hit
-    assert match.num_local_blocks == 20             # Full covers [0, 20)
+    assert match.local_slots.size == 20             # Full covers [0, 20)
     assert match.swa_start == 12                    # max(0, 20 - 8)
     assert len(match.swa_slots) == SWA_W            # window covers [12, 20)
     assert sorted(match.swa_slots.tolist()) == sorted(swa_slots.tolist())
@@ -456,11 +456,11 @@ def test_swa_take_is_all_or_none_and_the_query_pin_protects_the_window(env):
 
     match = engine.match(seq, component_mask=JOINT_MASK)
     assert len(match.swa_slots) == SWA_W
-    empty = engine.take(SWA_W, strict=False, component=_SWA)
+    empty = engine.take(SWA_W, component=_SWA)
     assert len(empty) == 0                          # all pinned -> all or none
     match.release()
 
-    evicted = engine.take(SWA_W, strict=False, component=_SWA)
+    evicted = engine.take(SWA_W, component=_SWA)
     assert len(evicted) == SWA_W                    # pin gone -> window evictable
     engine.recycle(evicted, component=_SWA)
 
@@ -472,12 +472,12 @@ def test_swa_insert_without_full_path_is_benign_and_recycles(env):
     engine, _server = _make_swa_engine(env, "/cers_swa_orphan", swa_slots=SWA_W)
     seq = FakeSeq(block_hashes=_hashes(44, 20), tokens_per_block=16)
 
-    swa_slots = engine.take(SWA_W, strict=False, component=_SWA)
+    swa_slots = engine.take(SWA_W, component=_SWA)
     assert len(swa_slots) == SWA_W
     # No Full path published: refused with FULL_PATH_MISSING, not raised.
     engine.insert(seq, swa_slots, num_insert_blocks=20, component=_SWA)
 
-    again = engine.take(SWA_W, strict=False, component=_SWA)
+    again = engine.take(SWA_W, component=_SWA)
     assert len(again) == SWA_W                      # auto-recycled, none leaked
     engine.recycle(again, component=_SWA)
 
@@ -511,7 +511,7 @@ def test_slot_store_pool_is_the_cpu_pool(env):
     from flexkv.storage.allocator import SlotStoreTensorHandle, slot_store_pool_tensor
 
     engine, _server = env.make("/cers_store", blocks=64)
-    store = engine.store
+    store = engine.client.store
     pool = store.pool(FULL)
     assert int(pool.num_slots) == 64
     assert int(pool.slot_bytes) == SLOT_BYTES          # exact stride, no padding
@@ -1423,12 +1423,12 @@ def test_put_then_get_swa_roundtrip_on_real_region():
         get_end_preds = set(graph._op_map[get_end].predecessors)
         assert {full_h2d[0].op_id, swa_h2d[0].op_id} <= get_end_preds
 
-        held = cpu.take(num_total, strict=False)
+        held = cpu.take(num_total)
         assert len(held) == num_total - 20
         cpu.recycle(held)
 
         get_cb()                                    # Full H2D + SWA H2D done
-        drained = cpu.take(num_total, strict=False)
+        drained = cpu.take(num_total)
         assert len(drained) == num_total
         cpu.recycle(drained)
 
@@ -1513,12 +1513,12 @@ def test_put_extension_releases_a_nonempty_match_pin_after_both_publishes():
         full_d2h, swa_d2h = _split_swa(_ops_by_type(graph)[TransferType.D2H])
         assert full_d2h[0].dst_block_ids.size == 10  # only the extension moves
         assert len(swa_d2h) == 1                     # window rides along
-        held = cpu.take(SWA_ENV_BLOCKS, strict=False)
+        held = cpu.take(SWA_ENV_BLOCKS)
         assert len(held) == SWA_ENV_BLOCKS - 20
         cpu.recycle(held)
 
         cb()                                        # FULL publish, SWA publish, release
-        drained = cpu.take(SWA_ENV_BLOCKS, strict=False)
+        drained = cpu.take(SWA_ENV_BLOCKS)
         assert len(drained) == SWA_ENV_BLOCKS       # pin gone, all evictable
         cpu.recycle(drained)
 
@@ -1706,12 +1706,11 @@ def _node_main(rank, prefix, cluster_id, registry, rdma_dev, ready, done, output
         )
         server = shmradix.RadixServer(cfg).start()      # collective: waits for both
         set_radixshmem_config(_radix_config().replace_server(endpoint=endpoint))
-        engine = CacheEngineRadixShmem(
-            device_type=DeviceType.CPU, num_total_blocks=PEER_BLOCKS,
-            tokens_per_block=16, shm_name=prefix, peer_enabled=True)
+        engine = CacheEngineRadixShmem(prefix, num_total_blocks=PEER_BLOCKS,
+                                       tokens_per_block=16, peer_enabled=True)
         if not engine.peer_enabled:
             raise RuntimeError("engine did not see a distributed region")
-        cluster_rank = engine.cluster_rank
+        cluster_rank = bootstrap.radix_cluster_rank(engine.client)
 
         hashes = np.arange(26, dtype=np.uint64) * 104729 + 101
         query_hashes = hashes[:-1]
@@ -1721,7 +1720,8 @@ def _node_main(rank, prefix, cluster_id, registry, rdma_dev, ready, done, output
 
         if rank == 0:
             sequence = _seq(hashes)
-            slots = engine.take(num_required_blocks=len(hashes), strict=True)
+            slots = engine.take(num_required_blocks=len(hashes))
+            assert len(slots) == len(hashes)
             for i, slot in enumerate(slots):
                 engine.client.slot_view(int(slot))[:] = _peer_pattern(i, writer=0)
             # insert() publishes and, with peer_enabled, flushes the RHT so the
@@ -1734,7 +1734,8 @@ def _node_main(rank, prefix, cluster_id, registry, rdma_dev, ready, done, output
         else:
             if local_head_blocks > 0:
                 head = hashes[:local_head_blocks]
-                head_slots = engine.take(num_required_blocks=local_head_blocks, strict=True)
+                head_slots = engine.take(num_required_blocks=local_head_blocks)
+                assert len(head_slots) == local_head_blocks
                 for i, slot in enumerate(head_slots):
                     engine.client.slot_view(int(slot))[:] = _peer_pattern(i, writer=1)
                 engine.insert(_seq(head), head_slots, num_insert_blocks=local_head_blocks)

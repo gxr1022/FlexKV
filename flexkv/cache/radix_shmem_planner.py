@@ -180,20 +180,23 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
 
         rcfg = self._radix_config
         return CacheEngineRadixShmem(
-            device_type=DeviceType.CPU,
-            num_total_blocks=cache_config.num_cpu_blocks,
+            radix_index_name(rcfg.local_id),
             tokens_per_block=cache_config.tokens_per_block,
-            shm_name=radix_index_name(rcfg.local_id),
-            evict_ratio=self.evict_ratio,
-            evict_start_threshold=self.evict_start_threshold,
-            hit_reward_seconds=self.hit_reward_seconds,
-            eviction_policy=self.eviction_policy,
-            event_collector=event_collector,
-            metrics_collector=self._metrics_collector,
-            protected_threshold=self.protected_threshold,
+            num_total_blocks=cache_config.num_cpu_blocks,
             peer_enabled=rcfg.distributed,
             swa_config=cache_config.swa,
+            event_collector=event_collector,
+            metrics_collector=self._metrics_collector,
         )
+
+    def _update_mempool_metrics(self) -> None:
+        if self._metrics_collector is None or self.cpu_cache_engine is None:
+            return
+        tier = self.cpu_cache_engine
+        # A radixshmem tier reports its own counts (no Mempool object).
+        pool = getattr(tier, "mempool", tier)
+        self._metrics_collector.update_mempool_stats(
+            "cpu", pool.num_total_blocks, pool.num_free_blocks)
 
     # ------------------------------------------------------------- entrances
 
@@ -492,7 +495,7 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
         if num_cpu_new <= 0:
             return _release_match()
 
-        cpu_new = cpu_engine.take(num_required_blocks=num_cpu_new, strict=False)
+        cpu_new = cpu_engine.take(num_required_blocks=num_cpu_new)
         if len(cpu_new) < num_cpu_new:
             flexkv_logger.warning(
                 f"radixshmem PUT {request_id} skipped: CPU "
@@ -506,8 +509,7 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
         swa_new: Optional[np.ndarray] = None
         if self.swa_op_constructor.enabled:
             k = min(block_mask_end, self.cache_config.swa.window_blocks)
-            swa_take = cpu_engine.take(num_required_blocks=k, strict=False,
-                                       component=COMPONENT_SWA)
+            swa_take = cpu_engine.take(num_required_blocks=k, component=COMPONENT_SWA)
             if len(swa_take) == k:
                 swa_new = swa_take
             else:
