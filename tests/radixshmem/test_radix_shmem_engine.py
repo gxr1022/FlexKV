@@ -84,7 +84,7 @@ def _load_module_direct(name: str, path: str):
     return module
 
 
-_FLEXKV_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+_FLEXKV_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
 _engine_mod = _load_module_direct(
     "_radix_shmem_engine_test",
     os.path.join(_FLEXKV_ROOT, "flexkv", "cache", "radix_shmem_engine.py"),
@@ -803,17 +803,18 @@ server:
 
 
 # =============================================================================
-# Part 2 — planning on the radixshmem backend (`_get_impl_radixshmem`,
-# `_prefetch_impl_radixshmem`, `_put_impl_radixshmem`), plus KVTaskEngine's
-# handling of a job-backed prefetch task. Synthetic matches, no region.
+# Part 2 — planning on the radixshmem backend (`RadixShmemCacheEngine._plan_get`,
+# `_plan_prefetch`, `_plan_put`, and the abort path of their handles), plus
+# KVTaskEngine's handling of a job-backed prefetch task. Synthetic matches, no
+# region.
 # =============================================================================
 
 TOKENS_PER_BLOCK = 16
 
 
 class FakeJob:
-    """Stand-in for `shmradix.GetJob`: what `_prefetch_impl_radixshmem` reads on
-    return (`local_hit`, `planned_hit`) and what `KVTaskEngine` polls."""
+    """Stand-in for `shmradix.GetJob`: what `_plan_prefetch` reads on return
+    (`local_hit`, `planned_hit`) and what `KVTaskEngine` polls."""
 
     def __init__(self, local_hit: int, planned_hit: int, job_id: int = 7):
         self.local_hit = local_hit
@@ -843,7 +844,10 @@ class FakeJob:
 
 
 def _global_cache_engine():
-    """Build a real `GlobalCacheEngine` (CPU tier only, accel index).
+    """Build a `RadixShmemCacheEngine` whose CPU tier is a plain `CacheEngineAccel`.
+
+    The radixshmem planners run for real; only the tier is swapped (no region
+    needed) and its tree side is then stubbed by `_force_radixshmem`.
 
     Imported here rather than at module scope: `flexkv.cache.__init__` pulls in
     `flexkv.c_ext` (libcudart), which Parts 1 and 3 deliberately avoid.
@@ -852,9 +856,15 @@ def _global_cache_engine():
         import torch
 
         from flexkv.cache.cache_engine import GlobalCacheEngine
+        from flexkv.cache.radix_shmem_planner import RadixShmemCacheEngine
         from flexkv.common.config import CacheConfig, ModelConfig
     except Exception as exc:  # pragma: no cover - environment-dependent
         pytest.skip(f"GlobalCacheEngine unavailable (needs CUDA + flexkv.c_ext): {exc}")
+
+    class _PlannerOnAccelTier(RadixShmemCacheEngine):
+        def _build_cpu_cache_engine(self, cache_config, event_collector):
+            return GlobalCacheEngine._build_cpu_cache_engine(
+                self, cache_config, event_collector)
 
     model_config = ModelConfig(
         num_layers=2, num_kv_heads=4, head_size=64,
@@ -865,7 +875,7 @@ def _global_cache_engine():
         enable_cpu=True, enable_ssd=False, enable_remote=False,
         num_cpu_blocks=256,
     )
-    return GlobalCacheEngine(cache_config, model_config)
+    return _PlannerOnAccelTier(cache_config, model_config)
 
 
 def _local_match(slots, finalize=None) -> ShmRadixMatch:
@@ -875,7 +885,7 @@ def _local_match(slots, finalize=None) -> ShmRadixMatch:
 
 def _force_radixshmem(engine, cpu_result: ShmRadixMatch, *, prefetch_job=None,
                       peer_enabled=None) -> None:
-    """Put a real `GlobalCacheEngine` on the radixshmem planners, tree side stubbed.
+    """Stub the tree side of a `_global_cache_engine()`.
 
     The tier keeps its real mempool (so `take` returns honest slot ids) but the
     tree side is faked: the synthetic match names no real prefix, and the tier
@@ -884,8 +894,7 @@ def _force_radixshmem(engine, cpu_result: ShmRadixMatch, *, prefetch_job=None,
     handed back (`engine.aborted_slots`), and the prefetch calls it made
     (`engine.prefetch_calls`).
     """
-    engine.use_radix_shmem = True                   # type: ignore[attr-defined]
-    engine._match_radixshmem = (  # type: ignore[method-assign]
+    engine._match_cpu = (  # type: ignore[method-assign]
         lambda *args, **kwargs: cpu_result
     )
     tier = engine.cpu_cache_engine
@@ -1045,7 +1054,7 @@ def test_prefetch_backpressure_skips_the_peer_walk():
     """Too many pulls in flight: no get_async, so the client never blocks."""
     engine = _global_cache_engine()
     limit = load_radixshmem_config(None).client.prefetch_max_inflight
-    engine.radix_prefetch_inflight = lambda: limit
+    engine._prefetch_jobs = [FakeJob(0, 4) for _ in range(limit)]   # none done
     _graph, ops, return_mask = _run_get(
         engine, 4, _local_match([]), prefetch=True, prefetch_job=FakeJob(0, 4))
     assert ops == {} and not bool(return_mask.any())
@@ -1156,7 +1165,7 @@ def test_task_engine_cancel_hands_the_job_back():
 # ---- PUT planning ----
 
 def _run_put(engine, num_blocks: int, cpu_result: ShmRadixMatch):
-    """Call put() through `_put_impl_radixshmem` with a forced match result."""
+    """Call put() through `_plan_put` with a forced match result."""
     _force_radixshmem(engine, cpu_result)
     token_ids, token_mask, slot_mapping = _fake_request(num_blocks)
     graph, return_mask, callback, _op_cbs, _end = engine.put(
@@ -1228,6 +1237,56 @@ def test_put_with_fully_cached_window_does_nothing():
     assert released == [1]
 
 
+# ---- abort: the plan was cancelled before its graph launched ----
+
+def test_get_abort_drops_the_pin():
+    """A cancelled GET never runs its H2D; abort releases the match pin, and a
+    late completion on the consumed handle does nothing more."""
+    engine = _global_cache_engine()
+    released = []
+    _run_get(engine, 4, _local_match(np.arange(40, 44),
+                                     finalize=lambda: released.append(1)))
+    assert released == []
+    engine.get_callback.abort()                     # type: ignore[attr-defined]
+    assert released == [1]
+    engine.get_callback()                           # type: ignore[attr-defined]
+    assert released == [1]
+    assert engine.inserted_pools == []              # type: ignore[attr-defined]
+
+
+def test_put_abort_returns_the_staged_slots_and_drops_the_pin():
+    """A cancelled PUT never runs its D2H: nothing is published, the staged
+    slots go back to the mempool and the match pin is released."""
+    engine = _global_cache_engine()
+    released = []
+    free_before = engine.cpu_cache_engine.mempool.num_free_blocks
+    _graph, ops, _mask = _run_put(
+        engine, num_blocks=5,
+        cpu_result=_local_match(np.arange(20, 23), finalize=lambda: released.append(1)))
+    staged = ops[TransferType.D2H][0].dst_block_ids
+    assert engine.cpu_cache_engine.mempool.num_free_blocks == free_before - 2
+    assert released == []
+
+    engine.put_callback.abort()                     # type: ignore[attr-defined]
+    assert engine.inserted_pools == []              # type: ignore[attr-defined]
+    assert [s.tolist() for s in engine.aborted_slots] == [staged.tolist()]
+    assert engine.cpu_cache_engine.mempool.num_free_blocks == free_before
+    assert released == [1]
+    engine.put_callback()                           # type: ignore[attr-defined]
+    assert engine.inserted_pools == []              # consumed: no late publish
+
+
+def test_prefetch_abort_leaves_the_job_alone():
+    """Cancelling a job-backed prefetch is KVTaskEngine's business (it cancels
+    the job); the plan itself holds nothing to roll back."""
+    engine = _global_cache_engine()
+    job = FakeJob(local_hit=0, planned_hit=4)
+    _run_get(engine, 4, _local_match([]), prefetch=True, prefetch_job=job)
+    engine.get_callback.abort()                     # type: ignore[attr-defined]
+    assert not job.cancelled
+    assert engine.aborted_slots == []               # type: ignore[attr-defined]
+
+
 # =============================================================================
 # Part 2b — SWA planning on a real region (needs c_ext for GlobalCacheEngine)
 # =============================================================================
@@ -1239,7 +1298,7 @@ SWA_ENV_BLOCKS = 64
 def _swa_global_engine(swa_slots: int = 2 * SWA_W,
                        num_blocks: int = SWA_ENV_BLOCKS,
                        window_blocks: int = SWA_W):
-    """A real `GlobalCacheEngine` on a real radix-server with the SWA component.
+    """A `RadixShmemCacheEngine` on a real radix-server with the SWA component.
 
     `cache_config.swa` + `enable_swa_transfer` turn on `swa_op_constructor`, and
     the same config drives the bootstrap, so this also covers the
@@ -1248,9 +1307,9 @@ def _swa_global_engine(swa_slots: int = 2 * SWA_W,
     """
     try:
         import torch
-        from flexkv.cache.cache_engine import GlobalCacheEngine
+        from flexkv.cache.radix_shmem_planner import RadixShmemCacheEngine
     except Exception as exc:  # pragma: no cover - environment-dependent
-        pytest.skip(f"GlobalCacheEngine unavailable (needs CUDA + flexkv.c_ext): {exc}")
+        pytest.skip(f"RadixShmemCacheEngine unavailable (needs CUDA + flexkv.c_ext): {exc}")
 
     from flexkv.common.config import CacheConfig, ModelConfig, SWAPoolConfig
 
@@ -1278,8 +1337,7 @@ def _swa_global_engine(swa_slots: int = 2 * SWA_W,
         cfg = bootstrap.build_radix_server_config(model_config, cache_config, rcfg)
         _sweep_region(cfg.index.name, cfg.resolved_data_name)
         server = shmradix.RadixServer(cfg).start()
-        engine = GlobalCacheEngine(cache_config, model_config)
-        assert engine.use_radix_shmem
+        engine = RadixShmemCacheEngine(cache_config, model_config)
         assert engine.swa_op_constructor.enabled, \
             "SWA gate should be on: enable_swa_transfer + radixshmem swa_enabled"
         yield engine

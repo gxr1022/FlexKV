@@ -147,7 +147,8 @@ def _node_proc(rank, gpu_id, cluster_id, config_path,
         tokens_per_block=TOKENS_PER_BLOCK,
         enable_cpu=True, enable_ssd=False, enable_remote=False,
         num_cpu_blocks=NUM_CPU_BLOCKS,
-        enable_p2p_cpu=True,
+        # Peer reuse follows the radixshmem YAML (expected_min_nodes=2 below),
+        # not enable_p2p_cpu.
     )
 
     report = {"rank": rank}

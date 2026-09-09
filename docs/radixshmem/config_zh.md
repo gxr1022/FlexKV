@@ -32,7 +32,9 @@
 - `FLEXKV_CPU_LAYOUT` 必须是 `BLOCKFIRST`。一个 SlotStore slot 就是一个连续的 CPU block，LAYERFIRST 给不出这个布局。
 - `FLEXKV_HUGETLBFS_DIR`（默认 `/mnt/hugepages`）：`server.hugepage_path` 为空且 `CacheConfig.use_hugepage_cpu_buffer` 为真时，radix 区域建在这个 hugetlbfs 挂载点下。
 
-该模式与 `enable_ssd`、`enable_remote` 互斥，启动时报错。
+该模式与 `enable_ssd`、`enable_remote` 互斥，启动时报错。`enable_p2p_cpu` / `enable_p2p_ssd` 也必须为 False：
+跨节点复用由 radix-server 自己完成（etcd + RDMA），在 YAML 使集群成为分布式（`expected_min_nodes > 1` 或
+`num_rht_shards > 1`）时自动开启，不再经过 FlexKV 的 Redis P2P 路径。
 
 ---
 
@@ -264,6 +266,7 @@ FlexKV 在加载 YAML 时检查以下条件，不满足直接报错，不等到 
 - `rht_transport` / `peer_index_transport` 不在 {xrc, dc}；`remote_op_transport` 不在 {zmq, dc}。
 - `client.prefetch_max_inflight >= client.max_outstanding`。
 - `FLEXKV_CPU_LAYOUT != BLOCKFIRST`，或 `num_cpu_blocks <= 0`，或 SWA 池装不下一个 window。
+- `CacheConfig` 打开了 `enable_ssd`、`enable_remote`、`enable_p2p_cpu` 或 `enable_p2p_ssd`。
 
 TE attach 后 `check_geometry` 复核 server 端的 `tokens_per_block`、各池 slot 数、slot 字节数和 stride，
 不一致则报错退出，不会静默错位传输。

@@ -76,6 +76,16 @@ class KVManager:
                 "radix_shmem backs the CPU tier only (index + SlotStore + peer "
                 "pull); set ssd_cache_gb=0 / enable_ssd=False"
             )
+        if self.use_radix_shmem and (cache_config.enable_p2p_cpu
+                                     or cache_config.enable_p2p_ssd):
+            # Peer reuse is the radix-server's (etcd + RDMA), switched on by the
+            # radixshmem YAML making the cluster distributed; the Redis-backed
+            # P2P paths these flags select must stay off.
+            raise ValueError(
+                "radix_shmem does its own peer reuse; set enable_p2p_cpu=False "
+                "and enable_p2p_ssd=False (cross-node reuse follows the "
+                "radixshmem YAML: expected_min_nodes / num_rht_shards)"
+            )
         # Prefix of this host's radix regions and TE channels: the YAML's
         # cluster_id (plus the node name when several nodes share the host).
         self._shm_radix_id = None
@@ -205,8 +215,8 @@ class KVManager:
             if self.local_dp_client_id == 0:
                 self._bootstrap_radix_shmem()
 
-            # GlobalCacheEngine reads GLOBAL_CONFIG_FROM_ENV.radix_shmem and
-            # builds a CacheEngineRadixShmem (RadixClient) for the CPU tier.
+            # KVTaskEngine reads GLOBAL_CONFIG_FROM_ENV.radix_shmem and builds a
+            # RadixShmemCacheEngine (CPU tier = RadixClient on the radix-server).
             self.kv_task_engine = KVTaskEngine(
                 self.model_config, self.cache_config,
                 self.gpu_register_port,

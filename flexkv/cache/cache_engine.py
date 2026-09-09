@@ -18,7 +18,7 @@ import threading
 import time
 from functools import partial, wraps
 from queue import Queue
-from typing import Any, List, Tuple, Optional, Dict, Callable
+from typing import List, Tuple, Optional, Dict, Callable
 from dataclasses import dataclass, field, replace
 
 import numpy as np
@@ -29,19 +29,10 @@ from flexkv.cache.hie_cache_engine import HierarchyLRCacheEngine
 from flexkv.cache.redis_meta import RedisMeta, dist_available
 
 from flexkv.cache.mempool import Mempool
-from flexkv.cache.radix_shmem_engine import (
-    COMPONENT_FULL,
-    COMPONENT_MASK_FULL,
-    COMPONENT_MASK_SWA,
-    COMPONENT_SWA,
-    ShmRadixMatch,
-    StagedRadixInsert,
-)
 from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
 from flexkv.cache.swa_cache_engine import SWAOpConstructor
 from flexkv.common.block import SequenceMeta, format_block_hash
-from flexkv.common.config import (CacheConfig, ModelConfig,
-                                  GLOBAL_CONFIG_FROM_ENV, SWAPoolConfig)
+from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV, SWAPoolConfig
 from flexkv.common.transfer import (
     CompletedOp,
     CompletionAwareCallback,
@@ -161,33 +152,23 @@ class DeferredCacheInsert:
 class GetTransferPlan:
     transfer_graph: TransferOpGraph
     finished_ops_ids: List[int]
+    node_to_unlock: Dict[DeviceType, Tuple[object, int]]
     op_callback_dict: Dict[int, Callable]
+    buffer_to_free: Dict[DeviceType, np.ndarray]
     num_gpu_blocks_to_transfer: int
     deferred_inserts: List[DeferredCacheInsert] = field(default_factory=list)
     # SWA read reservation held by this plan; released by an op callback on the
     # normal path, or by the abort path when the plan is cancelled unlaunched.
     swa_reservation: Optional["SWAReadReservation"] = None
-    # Used by the accel/hie/mooncake planners; radixshmem plans express the
-    # same completion work as on_complete closures and leave these empty.
-    node_to_unlock: Dict[DeviceType, Tuple[object, int]] = field(default_factory=dict)
-    buffer_to_free: Dict[DeviceType, np.ndarray] = field(default_factory=dict)
-    # Deferred actions run once the transfer graph completes: node unlock /
-    # set_ready / publish, buffer recycle, and radixshmem source-ref release.
-    on_complete: List[Callable[[], None]] = field(default_factory=list)
-    # radixshmem prefetch: the RadixClient.get_async job pulling a peer's run
-    # into this node, the local hit it started from and the hit it plans to
-    # reach (blocks). The graph is empty; KVTaskEngine completes the task from
-    # the job (see _prefetch_impl_radixshmem).
-    prefetch_job: Optional[Any] = None
-    prefetch_local_hit_blocks: int = 0
-    prefetch_planned_hit_blocks: int = 0
 
     @classmethod
     def empty(cls) -> "GetTransferPlan":
         return cls(
             transfer_graph=TransferOpGraph.create_empty_graph(),
             finished_ops_ids=[],
+            node_to_unlock={},
             op_callback_dict={},
+            buffer_to_free={},
             num_gpu_blocks_to_transfer=0,
         )
 
@@ -196,27 +177,24 @@ class GetTransferPlan:
 class PutTransferPlan:
     transfer_graph: TransferOpGraph
     finished_ops_ids: List[int]
+    node_to_unlock: Dict[DeviceType, Tuple[object, int]]
     op_callback_dict: Dict[int, Callable]
+    buffer_to_free: Dict[DeviceType, np.ndarray]
     num_gpu_blocks_to_transfer: int
     skipped_gpu_blocks: int
     deferred_inserts: List[DeferredCacheInsert] = field(default_factory=list)
     # SWA slots reserved for this put but not yet mounted (publication happens
     # in an op callback); the abort path must return them to the host pool.
     swa_slots_to_free: List[Tuple[DeviceType, int]] = field(default_factory=list)
-    # Used by the accel/hie/mooncake planners; radixshmem plans express the
-    # same completion work as on_complete closures and leave these empty.
-    node_to_unlock: Dict[DeviceType, Tuple[object, int]] = field(default_factory=dict)
-    buffer_to_free: Dict[DeviceType, np.ndarray] = field(default_factory=dict)
-    # Deferred actions run once the transfer graph completes: node unlock /
-    # set_ready / publish, buffer recycle, and radixshmem source-ref release.
-    on_complete: List[Callable[[], None]] = field(default_factory=list)
 
     @classmethod
     def empty(cls) -> "PutTransferPlan":
         return cls(
             transfer_graph=TransferOpGraph.create_empty_graph(),
             finished_ops_ids=[],
+            node_to_unlock={},
             op_callback_dict={},
+            buffer_to_free={},
             num_gpu_blocks_to_transfer=0,
             skipped_gpu_blocks=0,
         )
@@ -255,6 +233,18 @@ class SWAReadReservation:
     h2d_id: int
 
 
+@dataclass(frozen=True)
+class RequestWindow:
+    """A GET/PUT request reduced to whole blocks: the masked block range
+    ``[block_start_idx, block_end_idx)``, the GPU blocks it maps to, and the
+    SequenceMeta of the block-aligned token prefix."""
+
+    block_start_idx: int
+    block_end_idx: int
+    gpu_block_ids: np.ndarray
+    sequence_meta: SequenceMeta
+
+
 class TransferPlanHandle:
     """Completion callback for a planned get/put, with an abort path.
 
@@ -266,17 +256,12 @@ class TransferPlanHandle:
     cancel racing a completion cannot double-unlock.
     """
 
-    __slots__ = ("_complete", "_abort", "_consumed", "prefetch_job",
-                 "prefetch_local_hit_blocks", "prefetch_planned_hit_blocks")
+    __slots__ = ("_complete", "_abort", "_consumed")
 
     def __init__(self, complete: Callable[[], None], abort: Callable[[], None]):
         self._complete = complete
         self._abort = abort
         self._consumed = False
-        # radixshmem prefetch job riding along with the plan (GetTransferPlan).
-        self.prefetch_job = None
-        self.prefetch_local_hit_blocks = 0
-        self.prefetch_planned_hit_blocks = 0
 
     def __call__(self) -> None:
         if self._consumed:
@@ -932,9 +917,6 @@ class GlobalCacheEngine:
         # pybind releases the GIL around radix match/insert/evict. Protect the
         # tree across planning and callback-time rematch+insert transactions.
         self._cache_tree_lock = threading.RLock()
-        # radixshmem prefetch back-pressure: KVTaskEngine points this at its
-        # count of peer pulls in flight (see _prefetch_impl_radixshmem).
-        self.radix_prefetch_inflight: Callable[[], int] = lambda: 0
         self.cache_config = cache_config
         self.model_config = model_config
         self.tokens_per_block = cache_config.tokens_per_block
@@ -952,14 +934,7 @@ class GlobalCacheEngine:
             )
 
         self.index_accel = GLOBAL_CONFIG_FROM_ENV.index_accel
-        self.use_radix_shmem = GLOBAL_CONFIG_FROM_ENV.radix_shmem
-        # Prefix of this host's radix regions (the YAML's cluster_id, plus the
-        # node name for co-located nodes); None outside radixshmem mode.
-        self._shm_radix_id = None
-        if self.use_radix_shmem:
-            from flexkv.common.radixshmem_config import get_radixshmem_config
-            self._shm_radix_id = get_radixshmem_config().local_id
-        if cache_config.enable_kv_sharing and not self.use_radix_shmem:
+        if cache_config.enable_kv_sharing:
             assert redis_meta is not None
             self.redis_meta = redis_meta
             self.node_id = self.redis_meta.get_node_id()
@@ -979,9 +954,7 @@ class GlobalCacheEngine:
         if self._metrics_collector is None:
             self._metrics_collector = init_global_collector()
 
-        # radixshmem does its own peer reuse (etcd + RDMA inside radix-server),
-        # so the Redis-backed distributed extension is not needed there.
-        need_dist = not self.use_radix_shmem and (
+        need_dist = (
             (cache_config.enable_cpu and cache_config.enable_p2p_cpu)
             or (cache_config.enable_ssd and cache_config.enable_p2p_ssd)
             or (cache_config.enable_remote and cache_config.enable_kv_sharing)
@@ -994,58 +967,10 @@ class GlobalCacheEngine:
             )
 
         if cache_config.enable_cpu:
-            # Checked BEFORE enable_p2p_cpu: radix_shmem owns the index outright,
-            # the shared tree REPLACING the Redis-backed HierarchyLRCacheEngine
-            # rather than layering on it, and both backends read enable_p2p_* as
-            # "peer reuse is on".
-            if self.use_radix_shmem:
-                self.cpu_cache_engine = self._build_radix_shmem_engine(
-                    DeviceType.CPU, cache_config.num_cpu_blocks, event_collector,
-                    peer_enabled=cache_config.enable_p2p_cpu,
-                )
-            elif cache_config.enable_p2p_cpu:
-                self.cpu_cache_engine = HierarchyLRCacheEngine.from_cache_config(
-                    cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta)
-            elif self.index_accel:
-                self.cpu_cache_engine = CacheEngineAccel(
-                    device_type=DeviceType.CPU,
-                    num_total_blocks=cache_config.num_cpu_blocks,
-                    tokens_per_block=cache_config.tokens_per_block,
-                    evict_ratio=self.evict_ratio,
-                    hit_reward_seconds=self.hit_reward_seconds,
-                    evict_start_threshold=self.evict_start_threshold,
-                    eviction_policy=self.eviction_policy,
-                    event_collector=event_collector,
-                    metrics_collector=self._metrics_collector,
-                    protected_threshold=self.protected_threshold,
-                    swa_config=cache_config.swa,
-                )
-            else:
-                self.cpu_cache_engine = CacheEngine(
-                    device_type=DeviceType.CPU,
-                    num_total_blocks=cache_config.num_cpu_blocks,
-                    tokens_per_block=cache_config.tokens_per_block,
-                    evict_ratio=self.evict_ratio,
-                    hit_reward_seconds=self.hit_reward_seconds,
-                    evict_start_threshold=self.evict_start_threshold,
-                    eviction_policy=self.eviction_policy,
-                    event_collector=event_collector,
-                    metrics_collector=self._metrics_collector,
-                    protected_threshold=self.protected_threshold,
-                    swa_config=cache_config.swa,
-                )
+            self.cpu_cache_engine = self._build_cpu_cache_engine(cache_config, event_collector)
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
         if cache_config.enable_ssd:
-            # Checked BEFORE enable_p2p_ssd: radix_shmem owns the index outright,
-            # the shared tree REPLACING the Redis-backed HierarchyLRCacheEngine
-            # rather than layering on it, and both backends read enable_p2p_* as
-            # "peer reuse is on".
-            if self.use_radix_shmem:
-                self.ssd_cache_engine = self._build_radix_shmem_engine(
-                    DeviceType.SSD, cache_config.num_ssd_blocks, event_collector,
-                    peer_enabled=cache_config.enable_p2p_ssd,
-                )
-            elif cache_config.enable_p2p_ssd:
+            if cache_config.enable_p2p_ssd:
                 self.ssd_cache_engine = HierarchyLRCacheEngine.from_cache_config(
                     cache_config, self.node_id, DeviceType.SSD, meta=self.redis_meta)
             elif self.index_accel:
@@ -1087,10 +1012,6 @@ class GlobalCacheEngine:
                 # Build PCFSCacheEngine from CacheConfig directly (replacing RemotePCFSCacheEngine) TODO
                 self.remote_cache_engine = HierarchyLRCacheEngine.from_cache_config(
                     cache_config, self.node_id, DeviceType.REMOTE, meta=self.redis_meta)
-            elif self.use_radix_shmem:
-                self.remote_cache_engine = self._build_radix_shmem_engine(
-                    DeviceType.REMOTE, cache_config.num_remote_blocks, None
-                )
             elif self.index_accel:
                 self.remote_cache_engine = CacheEngineAccel(
                     device_type=DeviceType.REMOTE,
@@ -1128,41 +1049,51 @@ class GlobalCacheEngine:
         #TODO move this to kvmanager.start()
         self.start()
 
+        self._empty_get_return: Callable[[int], GetTransferPlan] = \
+            lambda request_id: GetTransferPlan.empty()
+        self._empty_put_return: Callable[[int], PutTransferPlan] = \
+            lambda request_id: PutTransferPlan.empty()
+
         # Update initial mempool stats
         self._update_mempool_metrics()
 
-    def _build_radix_shmem_engine(self,
-                                   device_type: DeviceType,
-                                   num_blocks: int,
-                                   event_collector,
-                                   peer_enabled: bool = False) -> "object":
-        """Attach to this node's radix-server as a RadixClient.
+    def _build_cpu_cache_engine(self,
+                                cache_config: CacheConfig,
+                                event_collector: Optional[KVEventCollector]):
+        """Pick the index engine of the CPU tier.
 
-        The server (index + SlotStore + peer transfer) is brought up by the
-        KVManager bootstrap process or by the operator (see
-        `shm_radix_bootstrap`); the attach waits for it to be ready.
+        A subclass can back the tier with a different engine by overriding this
+        (see ``flexkv.cache.radix_shmem_planner``).
         """
-        from flexkv.cache.radix_shmem_engine import CacheEngineRadixShmem
-        from flexkv.server.shm_radix_bootstrap import radix_index_name
-
-        if device_type != DeviceType.CPU:
-            raise ValueError(
-                f"radix_shmem backs the CPU tier only; {device_type.name} cannot be "
-                f"enabled together with FLEXKV_RADIX_SHMEM=1")
-        return CacheEngineRadixShmem(
-            device_type=device_type,
-            num_total_blocks=num_blocks,
-            tokens_per_block=self.cache_config.tokens_per_block,
-            shm_name=radix_index_name(self._shm_radix_id),
+        if cache_config.enable_p2p_cpu:
+            return HierarchyLRCacheEngine.from_cache_config(
+                cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta)
+        if self.index_accel:
+            return CacheEngineAccel(
+                device_type=DeviceType.CPU,
+                num_total_blocks=cache_config.num_cpu_blocks,
+                tokens_per_block=cache_config.tokens_per_block,
+                evict_ratio=self.evict_ratio,
+                hit_reward_seconds=self.hit_reward_seconds,
+                evict_start_threshold=self.evict_start_threshold,
+                eviction_policy=self.eviction_policy,
+                event_collector=event_collector,
+                metrics_collector=self._metrics_collector,
+                protected_threshold=self.protected_threshold,
+                swa_config=cache_config.swa,
+            )
+        return CacheEngine(
+            device_type=DeviceType.CPU,
+            num_total_blocks=cache_config.num_cpu_blocks,
+            tokens_per_block=cache_config.tokens_per_block,
             evict_ratio=self.evict_ratio,
-            evict_start_threshold=self.evict_start_threshold,
             hit_reward_seconds=self.hit_reward_seconds,
+            evict_start_threshold=self.evict_start_threshold,
             eviction_policy=self.eviction_policy,
             event_collector=event_collector,
             metrics_collector=self._metrics_collector,
             protected_threshold=self.protected_threshold,
-            peer_enabled=peer_enabled,
-            swa_config=self.cache_config.swa,
+            swa_config=cache_config.swa,
         )
 
     def start(self) -> None:
@@ -1206,66 +1137,19 @@ class GlobalCacheEngine:
             namespace: Optional[List[str]] = None,
             swa_aware: bool = False) \
                  -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
-        self._check_input(token_ids, token_mask, slot_mapping)
-
-        aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
-
-        aligned_token_ids = token_ids[:aligned_length]
-        token_mask[aligned_length:] = False
-
-        if aligned_length == 0 or not token_mask.any():
+        req = self._prepare_request(token_ids, token_mask, slot_mapping, namespace)
+        if req.block_end_idx == 0:
             transfer_graph = TransferOpGraph.create_empty_graph()
             return_mask = np.zeros_like(token_mask, dtype=np.bool_)
-            callback = partial(self._transfer_callback, on_complete=[])
+            callback = partial(self._transfer_callback, node_to_unlock={}, buffer_to_free={})
             return transfer_graph, return_mask, callback, {}, -1
-
-        block_start_idx, block_end_idx = self._get_block_range(token_mask)
-        # block_end_idx is the block just past the LAST True in token_mask. On the
-        # plain path the caller marks every non-resident token up to the aligned
-        # end, so this equals aligned_length // tokens_per_block. On the SWA-aware
-        # path (swa_aware=True) _get_impl_* clamps the window to usable = min(full,
-        # swa) after matching, which can end before the aligned length. So the
-        # invariant is <= (can never exceed the aligned length), not ==. Nothing
-        # below uses aligned_length; all downstream sizing keys off block_end_idx.
-        assert block_end_idx <= aligned_length // self.tokens_per_block
-        gpu_block_ids = self.slot_mapping_to_block_ids(slot_mapping,
-                                                       self.tokens_per_block)[:block_end_idx-block_start_idx]
-
-        sequence_meta = SequenceMeta(token_ids=aligned_token_ids,
-                                     tokens_per_block=self.cache_config.tokens_per_block,
-                                     namespace=namespace)
+        block_start_idx, block_end_idx = req.block_start_idx, req.block_end_idx
+        gpu_block_ids, sequence_meta = req.gpu_block_ids, req.sequence_meta
 
         temp_cache_strategy = resolve_get_cache_strategy(
             self.use_mooncake_store_backend, temp_cache_strategy)
 
-        # getattr: test engines built with ``__new__`` may predate the flag.
-        use_radix_shmem = getattr(self, "use_radix_shmem", False)
-        if use_radix_shmem and temp_cache_strategy.ignore_gpu:
-            # Prefetch on the radixshmem tier: pull a peer's run into this node.
-            plan = self._prefetch_impl_radixshmem(
-                request_id,
-                sequence_meta,
-                block_start_idx,
-                block_end_idx,
-                temp_cache_strategy,
-                dp_client_id,
-                swa_aware=swa_aware,
-            )
-        elif use_radix_shmem:
-            # Dispatched ahead of the enable_remote branch, which KVManager
-            # already rules out here: a local match and the insert-after-transfer
-            # order (peer blocks arrived through the prefetch above).
-            plan = self._get_impl_radixshmem(
-                request_id,
-                sequence_meta,
-                block_start_idx,
-                block_end_idx,
-                gpu_block_ids,
-                temp_cache_strategy,
-                dp_client_id,
-                swa_aware=swa_aware,
-            )
-        elif not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
+        if not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
             # from this entrance, we will also handle the case of peer_cpu and peer_ssd
             plan = self._get_impl_local(
                 request_id,
@@ -1297,14 +1181,7 @@ class GlobalCacheEngine:
             )
 
         return_mask = np.zeros_like(token_mask, dtype=np.bool_)
-        # getattr: planner stubs in tests return plain plan objects.
-        prefetch_job = getattr(plan, "prefetch_job", None)
-        if prefetch_job is not None:
-            # radixshmem peer prefetch: the planned pull [local hit, planned hit);
-            # KVTaskEngine rewrites it to what landed when the job completes.
-            return_mask[plan.prefetch_local_hit_blocks * self.tokens_per_block:
-                        plan.prefetch_planned_hit_blocks * self.tokens_per_block] = True
-        elif temp_cache_strategy.ignore_gpu and temp_cache_strategy.ignore_gds:
+        if temp_cache_strategy.ignore_gpu and temp_cache_strategy.ignore_gds:
             # Prefetch return_mask covers Full REMOTE2H tokens only (A: planned
             # remote pull). SWA REMOTE2H ops live in a separate slot space and
             # must not be summed into prefetch_blocks. Place the True span at
@@ -1339,20 +1216,13 @@ class GlobalCacheEngine:
             complete=partial(self._transfer_callback,
                              node_to_unlock=plan.node_to_unlock,
                              buffer_to_free=plan.buffer_to_free,
-                             deferred_inserts=plan.deferred_inserts,
-                             on_complete=plan.on_complete),
+                             deferred_inserts=plan.deferred_inserts),
             abort=partial(self._abort_transfer_plan,
                           node_to_unlock=plan.node_to_unlock,
                           buffer_to_free=plan.buffer_to_free,
                           deferred_inserts=plan.deferred_inserts,
                           swa_reservation=plan.swa_reservation),
         )
-
-        # The prefetch job rides along with the handle: KVTaskEngine completes a
-        # job-backed task from it instead of from graph completion.
-        callback.prefetch_job = prefetch_job
-        callback.prefetch_local_hit_blocks = getattr(plan, "prefetch_local_hit_blocks", 0)
-        callback.prefetch_planned_hit_blocks = getattr(plan, "prefetch_planned_hit_blocks", 0)
 
         op_callback_dict = plan.op_callback_dict
 
@@ -1404,12 +1274,6 @@ class GlobalCacheEngine:
         engine = self.cache_engines[device_type]
         engine.index.set_swa(node, int(slot))
 
-    def _empty_get_return(self, request_id: int) -> GetTransferPlan:
-        return GetTransferPlan.empty()
-
-    def _empty_put_return(self, request_id: int) -> PutTransferPlan:
-        return PutTransferPlan.empty()
-
     def _fail_put_before_insert(
             self,
             request_id: int,
@@ -1419,8 +1283,7 @@ class GlobalCacheEngine:
             ssd_blocks: Optional[np.ndarray] = None,
             ssd_swa_slot: int = -1,
             remote_blocks: Optional[np.ndarray] = None,
-            remote_swa_slot: int = -1,
-            match_finalizers: Optional[List[Callable]] = None) -> PutTransferPlan:
+            remote_swa_slot: int = -1) -> PutTransferPlan:
         flexkv_logger.warning(
             "[FlexKV-SWA] PUT request failed before radix insert; "
             f"request_id={request_id}, reason={reason}, "
@@ -1440,9 +1303,6 @@ class GlobalCacheEngine:
             self.ssd_cache_engine.recycle(ssd_blocks)
         if remote_blocks is not None:
             self.remote_cache_engine.recycle(remote_blocks)
-        # No transfer will consume the matched prefix; release its ref now.
-        for fn in match_finalizers or []:
-            fn()
         return self._empty_put_return(request_id)
 
     def _get_impl_global(self,
@@ -2137,154 +1997,6 @@ class GlobalCacheEngine:
             swa_reservation=swa_reservation,
         )
 
-    def _match_radixshmem(self,
-                          sequence_meta: SequenceMeta,
-                          swa_aware: bool = False,
-                          swa_query_end: Optional[int] = None) -> ShmRadixMatch:
-        """Local CPU match for the radixshmem planners (GET and PUT alike).
-
-        radixshmem's `match` never leaves this node: peer blocks reach the local
-        tree through `_prefetch_impl_radixshmem`, so a GET sees them as an
-        ordinary local hit once the prefetch has completed.
-
-        ``swa_aware`` turns the match into a joint FULL|SWA query capped at
-        ``swa_query_end``: its ``num_matched_blocks`` is then the common hit both
-        components can serve, and the window (``swa_slots``) ends exactly there.
-        """
-        assert self.cpu_cache_engine is not None
-        if swa_aware:
-            return self.cpu_cache_engine.match(
-                sequence_meta,
-                component_mask=COMPONENT_MASK_FULL | COMPONENT_MASK_SWA,
-                query_end=swa_query_end,
-            )
-        return self.cpu_cache_engine.match(sequence_meta)
-
-    def _get_impl_radixshmem(self,
-                             request_id: int,
-                             sequence_meta: SequenceMeta,
-                             block_mask_start: int,
-                             block_mask_end: int,
-                             gpu_block_ids: np.ndarray,
-                             temp_cache_strategy: CacheStrategy,
-                             dp_client_id: int,
-                             swa_aware: bool = False) \
-                                 -> GetTransferPlan:
-        """GET planner for the radixshmem CPU tier: local match, one H2D.
-
-        Peer blocks are not spliced into a GET. `_prefetch_impl_radixshmem`
-        (sglang's prefetch hooks run it ahead of scheduling) pulls a peer's run
-        into this node's tree, so by the time the request is matched here the
-        local hit already covers them; whatever is not local is a miss.
-
-        Slots join the tree only once they hold data, so nothing here mutates
-        the tree: the match pin is the only state, released at graph completion.
-        """
-        nvtx_range = nvtx.start_range(
-            message=f"CacheEngine.get_impl_radixshmem[{request_id}]", color="cyan")
-        assert not temp_cache_strategy.ignore_gpu
-        assert self.cache_config.enable_cpu
-        assert self.cpu_cache_engine is not None
-        swa_active = swa_aware and self.swa_op_constructor.enabled
-        cpu_match = self._match_radixshmem(
-            sequence_meta, swa_aware=swa_active, swa_query_end=block_mask_end)
-
-        end = min(cpu_match.num_matched_blocks, block_mask_end)
-        if end <= block_mask_start:
-            # Nothing to restore; drop the query's pin now.
-            cpu_match.release()
-            if self._metrics_collector is not None and block_mask_end > block_mask_start:
-                self._metrics_collector.record_cache_miss(
-                    block_mask_end - block_mask_start)
-            nvtx.end_range(nvtx_range)
-            return self._empty_get_return(request_id)
-
-        if self._metrics_collector is not None:
-            self._metrics_collector.record_cache_hit("cpu", end - block_mask_start)
-            if block_mask_end > end:
-                self._metrics_collector.record_cache_miss(block_mask_end - end)
-
-        transfer_graph = TransferOpGraph()
-        op_h2d = TransferOp(
-            graph_id=transfer_graph.graph_id,
-            transfer_type=TransferType.H2D,
-            src_block_ids=cpu_match.local_range(block_mask_start, end),
-            dst_block_ids=gpu_block_ids[:end - block_mask_start],
-            dp_client_id=dp_client_id,
-        )
-        transfer_graph.add_transfer_op(op_h2d)
-        finished_ops_ids = [op_h2d.op_id]
-
-        if swa_active and len(cpu_match.swa_slots) > 0:
-            swa_h2d_id = self.swa_op_constructor.build_get_chain(
-                transfer_graph,
-                gpu_slot_ids=np.zeros(len(cpu_match.swa_slots), dtype=np.int64),
-                cpu_slot_ids=cpu_match.swa_slots,
-                dp_client_id=dp_client_id,
-            )
-            if swa_h2d_id is not None:
-                finished_ops_ids.append(swa_h2d_id)
-
-        nvtx.end_range(nvtx_range)
-        return GetTransferPlan(
-            transfer_graph=transfer_graph,
-            finished_ops_ids=finished_ops_ids,
-            op_callback_dict={},
-            num_gpu_blocks_to_transfer=end - block_mask_start,
-            on_complete=[cpu_match.release],
-        )
-
-    def _prefetch_impl_radixshmem(self,
-                                  request_id: int,
-                                  sequence_meta: SequenceMeta,
-                                  block_mask_start: int,
-                                  block_mask_end: int,
-                                  temp_cache_strategy: CacheStrategy,
-                                  dp_client_id: int,
-                                  swa_aware: bool = False) \
-                                      -> GetTransferPlan:
-        """PREFETCH planner for the radixshmem CPU tier: start a peer pull.
-
-        `RadixClient.get_async` queries the cluster, stages local slots for a
-        peer's run, has the radix-server RDMA-read it and publishes the blocks
-        into this node's tree when the transfer completes. Nothing moves through
-        the TE, so the plan's graph is empty and the task completes when the job
-        does (`KVTaskEngine` polls it). A node without peers, or one with too
-        many pulls in flight, returns an empty plan: the later local GET says
-        what is here.
-        """
-        assert temp_cache_strategy.ignore_gpu
-        assert self.cpu_cache_engine is not None
-        engine = self.cpu_cache_engine
-        if not engine.peer_enabled:
-            return self._empty_get_return(request_id)
-        inflight = self.radix_prefetch_inflight()
-        from flexkv.common.radixshmem_config import get_radixshmem_config
-        client_settings = get_radixshmem_config().client
-        max_inflight = client_settings.prefetch_max_inflight
-        if inflight >= max_inflight:
-            flexkv_logger.debug(
-                f"radixshmem prefetch {request_id}: {inflight} peer pulls in flight "
-                f"(limit {max_inflight}); skipping the peer walk")
-            return self._empty_get_return(request_id)
-        swa_active = swa_aware and self.swa_op_constructor.enabled
-        mask = (COMPONENT_MASK_FULL | COMPONENT_MASK_SWA) if swa_active else COMPONENT_MASK_FULL
-        job = engine.prefetch(
-            sequence_meta,
-            component_mask=mask,
-            query_end=block_mask_end,
-            timeout_ms=client_settings.prefetch_timeout_ms,
-        )
-        plan = self._empty_get_return(request_id)
-        if job is None:
-            return plan
-        plan.prefetch_job = job
-        plan.prefetch_local_hit_blocks = int(job.local_hit)
-        plan.prefetch_planned_hit_blocks = int(job.planned_hit)
-        if self._metrics_collector is not None and job.planned_hit > job.local_hit:
-            self._metrics_collector.record_cache_hit("peer", job.planned_hit - job.local_hit)
-        return plan
-
     @_synchronized_cache_tree
     def put(self,
             request_id: int,
@@ -2295,37 +2007,14 @@ class GlobalCacheEngine:
             temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
             namespace: Optional[List[str]] = None) \
                 -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
-        self._check_input(token_ids, token_mask, slot_mapping)
-        # ignore the last incomplete block
-        aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
-        aligned_token_ids = token_ids[:aligned_length]
-        token_mask[aligned_length:] = False
-        block_start_idx, block_end_idx = self._get_block_range(token_mask)
-
+        req = self._prepare_request(token_ids, token_mask, slot_mapping, namespace)
+        block_start_idx, block_end_idx = req.block_start_idx, req.block_end_idx
         # the mask should has a prefix of True
         assert block_start_idx == 0
-
-        gpu_block_ids = self.slot_mapping_to_block_ids(slot_mapping,
-                                                       self.tokens_per_block)[:block_end_idx-block_start_idx]
-
-        sequence_meta = SequenceMeta(token_ids=aligned_token_ids,
-                                     tokens_per_block=self.cache_config.tokens_per_block,
-                                     namespace=namespace)
+        gpu_block_ids, sequence_meta = req.gpu_block_ids, req.sequence_meta
 
         assert not temp_cache_strategy.ignore_gpu
-        if self.use_radix_shmem:
-            # See the matching branch in get(): insert-after-transfer, and
-            # enable_remote is already excluded for this backend.
-            plan = self._put_impl_radixshmem(
-                request_id,
-                sequence_meta,
-                block_start_idx,
-                block_end_idx,
-                gpu_block_ids,
-                temp_cache_strategy,
-                dp_client_id,
-            )
-        elif not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
+        if not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
             plan = self._put_impl_local(
                 request_id,
                 sequence_meta,
@@ -2365,7 +2054,6 @@ class GlobalCacheEngine:
                              node_to_unlock=plan.node_to_unlock,
                              buffer_to_free=plan.buffer_to_free,
                              deferred_inserts=plan.deferred_inserts,
-                             on_complete=plan.on_complete,
                              is_put=True),
             abort=partial(self._abort_transfer_plan,
                           node_to_unlock=plan.node_to_unlock,
@@ -3002,133 +2690,6 @@ class GlobalCacheEngine:
             swa_slots_to_free=swa_slots_to_free,
         )
 
-    def _put_impl_radixshmem(self,
-            request_id: int,
-            sequence_meta: SequenceMeta,
-            block_mask_start: int,
-            block_mask_end: int,
-            gpu_block_ids: np.ndarray,
-            temp_cache_strategy: CacheStrategy,
-            dp_client_id: int) \
-                -> PutTransferPlan:
-        """PUT planner for the radixshmem CPU tier.
-
-        Local only, like every PUT. The one difference from ``_put_impl_local``
-        is WHEN the tree learns about the slots -- radixshmem accepts them only
-        once they hold data, so the insert moves into the graph-completion
-        callback.
-
-        Block index:  0        cpu_tot                    block_mask_end
-            GPU     : (skipped) |          fragment           |
-                                     |  D2H into new slots
-            CPU     : (cached) -+
-        """
-        enable_gpu = not temp_cache_strategy.ignore_gpu
-        assert enable_gpu
-        assert self.cache_config.enable_cpu
-        assert self.cpu_cache_engine is not None
-
-        cpu_match = self._match_radixshmem(sequence_meta)
-
-        def _release_match() -> PutTransferPlan:
-            # Nothing will consume the matched prefix; drop the query's pin now.
-            cpu_match.release()
-            return self._empty_put_return(request_id)
-
-        num_skipped = len(cpu_match.local_range(block_mask_start, block_mask_end))
-        # First window block the CPU tier does not already hold.
-        num_cpu_new = block_mask_end - block_mask_start - num_skipped
-        # Same policy as _put_impl_local: a fully-matched CPU prefix ends the PUT.
-        # This also skips the SWA sidecar, so a window lost to SWA-pool eviction
-        # is not republished until the Full path ages out (accepted limitation).
-        if num_cpu_new <= 0:
-            return _release_match()
-
-        cpu_new = self.cpu_cache_engine.take(num_required_blocks=num_cpu_new,
-                                             strict=False)
-        if len(cpu_new) < num_cpu_new:
-            flexkv_logger.warning(
-                f"radixshmem PUT {request_id} skipped: CPU "
-                f"{len(cpu_new)}/{num_cpu_new} slots available"
-            )
-            self.cpu_cache_engine.recycle(cpu_new)
-            if self._metrics_collector is not None:
-                self._metrics_collector.record_allocation_failure("local")
-            return _release_match()
-
-        swa_new: Optional[np.ndarray] = None
-        if self.swa_op_constructor.enabled:
-            k = min(block_mask_end, self.cache_config.swa.window_blocks)
-            swa_take = self.cpu_cache_engine.take(num_required_blocks=k,
-                                                  strict=False,
-                                                  component=COMPONENT_SWA)
-            if len(swa_take) == k:
-                swa_new = swa_take
-            else:
-                # All-or-none contract says this is empty; recycle defensively
-                # in case it ever is not.
-                self.cpu_cache_engine.recycle(swa_take, component=COMPONENT_SWA)
-                flexkv_logger.warning(
-                    f"radixshmem PUT {request_id}: no {k}-slot SWA window "
-                    f"available; storing Full KV only"
-                )
-
-        transfer_graph = TransferOpGraph()
-        finished_ops_ids: List[int] = []
-
-        fragment_gpu_blocks = gpu_block_ids[num_skipped:]
-        op_d2h = TransferOp(
-            graph_id=transfer_graph.graph_id,
-            transfer_type=TransferType.D2H,
-            src_block_ids=fragment_gpu_blocks,
-            dst_block_ids=cpu_new,
-            dp_client_id=dp_client_id,
-        )
-        transfer_graph.add_transfer_op(op_d2h)
-        finished_ops_ids.append(op_d2h.op_id)
-
-        if swa_new is not None:
-            swa_ops = self.swa_op_constructor.build_put_chain(
-                transfer_graph,
-                gpu_slot_ids=np.zeros(len(swa_new), dtype=np.int64),
-                cpu_slot_ids=swa_new,
-                dp_client_id=dp_client_id,
-                return_op_ids=True,
-            )
-            assert swa_ops.d2h_id is not None
-            finished_ops_ids.append(swa_ops.d2h_id)
-
-        on_complete: List[Callable[[], None]] = []
-
-        def _arm(slots: np.ndarray,
-                 hold: Optional[Callable[[], None]], label: str,
-                 component=COMPONENT_FULL) -> None:
-            staged = StagedRadixInsert(engine=self.cpu_cache_engine,
-                                        sequence_meta=sequence_meta,
-                                        slots=slots,
-                                        path_end=block_mask_end,
-                                        label=label,
-                                        holds=[] if hold is None else [hold],
-                                        component=component)
-            on_complete.append(staged.publish)
-
-        # The match pin travels with the LAST publish: SWA's insert refuses paths
-        # the Full tree does not reach yet, so it runs after FULL and releases.
-        _arm(cpu_new, cpu_match.release if swa_new is None else None,
-             f"PUT {request_id} CPU")
-        if swa_new is not None:
-            _arm(swa_new, cpu_match.release, f"PUT {request_id} CPU SWA",
-                 component=COMPONENT_SWA)
-
-        return PutTransferPlan(
-            transfer_graph=transfer_graph,
-            finished_ops_ids=finished_ops_ids,
-            op_callback_dict={},
-            num_gpu_blocks_to_transfer=len(fragment_gpu_blocks),
-            skipped_gpu_blocks=num_skipped,
-            on_complete=on_complete,
-        )
-
     @staticmethod
     def _matched_boundary_node(current_match, matched_blocks: int):
         """Return the matched node only when ``matched_blocks`` ends on it."""
@@ -3349,7 +2910,6 @@ class GlobalCacheEngine:
                            node_to_unlock: Dict[DeviceType, Tuple[RadixNode, int]],
                            buffer_to_free: Optional[Dict[DeviceType, np.ndarray]] = None,
                            deferred_inserts: Optional[List[DeferredCacheInsert]] = None,
-                           on_complete: Optional[List[Callable[[], None]]] = None,
                            is_put: bool = False) -> None:
         try:
             for pending in deferred_inserts or []:
@@ -3411,10 +2971,6 @@ class GlobalCacheEngine:
                 if DeviceType.REMOTE in buffer_to_free:
                     assert self.remote_cache_engine is not None
                     self.remote_cache_engine.recycle(buffer_to_free[DeviceType.REMOTE])
-            # Closure-style completion actions of the radixshmem planners
-            # (staged publish, match-pin release); each closure owns its ordering.
-            for action in on_complete or []:
-                action()
 
     @_synchronized_cache_tree
     def _abort_transfer_plan(self,
@@ -3753,6 +3309,37 @@ class GlobalCacheEngine:
             remote_matched_result = self.remote_cache_engine.match(sequence_meta)
 
         return cpu_matched_result, ssd_matched_result, remote_matched_result
+
+    def _prepare_request(self,
+                         token_ids: np.ndarray,
+                         token_mask: np.ndarray,
+                         slot_mapping: np.ndarray,
+                         namespace: Optional[List[str]]) -> RequestWindow:
+        """Shared GET/PUT prologue.
+
+        Validates the arrays, drops the trailing partial block (``token_mask``
+        is cleared past the aligned length in place) and resolves the masked
+        block window. ``block_end_idx == 0`` means nothing is left to plan.
+        """
+        self._check_input(token_ids, token_mask, slot_mapping)
+        aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
+        aligned_token_ids = token_ids[:aligned_length]
+        token_mask[aligned_length:] = False
+        block_start_idx, block_end_idx = self._get_block_range(token_mask)
+        # block_end_idx is the block just past the LAST True in token_mask. On the
+        # plain path the caller marks every non-resident token up to the aligned
+        # end, so this equals aligned_length // tokens_per_block. On the SWA-aware
+        # path (swa_aware=True) _get_impl_* clamps the window to usable = min(full,
+        # swa) after matching, which can end before the aligned length. So the
+        # invariant is <= (can never exceed the aligned length), not ==. Nothing
+        # downstream uses aligned_length; all sizing keys off block_end_idx.
+        assert block_end_idx <= aligned_length // self.tokens_per_block
+        gpu_block_ids = self.slot_mapping_to_block_ids(
+            slot_mapping, self.tokens_per_block)[:block_end_idx - block_start_idx]
+        sequence_meta = SequenceMeta(token_ids=aligned_token_ids,
+                                     tokens_per_block=self.cache_config.tokens_per_block,
+                                     namespace=namespace)
+        return RequestWindow(block_start_idx, block_end_idx, gpu_block_ids, sequence_meta)
 
     def _check_input(self,
                       token_ids: np.ndarray,

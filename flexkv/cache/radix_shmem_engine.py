@@ -138,7 +138,8 @@ class StagedRadixInsert:
     ``publish`` takes no ref on what it attached (the transfer is over, so the
     span has no reader), but it IS only legal while the ref keeping the local
     tree reaching the span's start is held -- pass that as ``holds``, which it
-    drops afterwards.
+    drops afterwards. ``abort`` is the other exit: the plan was cancelled before
+    its graph ran, so the slots go back to the mempool and the holds drop.
 
     ``component`` is one ComponentType (default FULL), not a query mask. A
     Full+SWA PUT arms two instances, FULL first: SWA's insert refuses paths
@@ -181,6 +182,24 @@ class StagedRadixInsert:
                 f"staged slots failed: {e}; returning them to the mempool"
             )
             self._engine.recycle(self._slots, component=self._component)
+        finally:
+            self._release_holds()
+
+    def abort(self) -> None:
+        """The graph never ran: hand the staged slots back and drop the holds.
+
+        Exclusive with ``publish``; whichever runs first settles the insert.
+        """
+        if self._settled:
+            return
+        self._settled = True
+        try:
+            self._engine.recycle(self._slots, component=self._component)
+        except Exception as e:
+            flexkv_logger.error(
+                f"radixshmem {self._label}: recycle of {len(self._slots)} "
+                f"staged slots failed: {e}"
+            )
         finally:
             self._release_holds()
 
