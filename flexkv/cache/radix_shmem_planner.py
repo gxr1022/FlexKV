@@ -3,7 +3,7 @@
 `RadixShmemCacheEngine` is `GlobalCacheEngine` with the CPU tier backed by a
 radix-server: `CacheEngineRadixShmem`, a `RadixClient` on the shared index and
 SlotStore that `shm_radix_bootstrap` brings up. `KVTaskEngine` picks this class
-when ``FLEXKV_RADIX_SHMEM=1``.
+when ``FLEXKV_ENABLE_RADIXSHMEM=1``.
 
 Why a subclass rather than more branches in `GlobalCacheEngine`:
 

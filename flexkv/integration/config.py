@@ -512,10 +512,10 @@ class FlexKVConfig:
         attn_cp_size = int(getattr(server_args, 'attn_cp_size', 1))
         kv_cache_dtype = getattr(server_args, 'kv_cache_dtype', None)
         local_dp_size = self.get_sglang_node_local_dp_size(server_args) \
-            if GLOBAL_CONFIG_FROM_ENV.radix_shmem \
+            if GLOBAL_CONFIG_FROM_ENV.enable_radixshmem \
             else None
 
-        if dp_rank is None and GLOBAL_CONFIG_FROM_ENV.radix_shmem and sglang_dp_size > 1:
+        if dp_rank is None and GLOBAL_CONFIG_FROM_ENV.enable_radixshmem and sglang_dp_size > 1:
             # Every DP process would derive dp_client_id 0: the same radix-server
             # bootstrap ownership, TE channel and graph/op id range.
             raise ValueError(
@@ -532,7 +532,7 @@ class FlexKVConfig:
                 int(node_rank),
             )
         elif (
-            GLOBAL_CONFIG_FROM_ENV.radix_shmem
+            GLOBAL_CONFIG_FROM_ENV.enable_radixshmem
             and enable_dp_attention
             and sglang_dp_size > 1
             and int(nnodes) > 1

@@ -326,7 +326,7 @@ class FlexKVConnector:
             or self.cache_config.enable_kv_sharing
             # radixshmem cluster: prefetch is where a peer's blocks are pulled
             # into this node (RadixClient.get_async); GET then matches locally.
-            or (GLOBAL_CONFIG_FROM_ENV.radix_shmem and _radixshmem_distributed())
+            or (GLOBAL_CONFIG_FROM_ENV.enable_radixshmem and _radixshmem_distributed())
         )
         self._shutdown_done = False
 

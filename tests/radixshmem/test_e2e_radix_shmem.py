@@ -1,4 +1,4 @@
-"""End-to-end test of FLEXKV_RADIX_SHMEM=1 on one node: one or two DP scheduler
+"""End-to-end test of FLEXKV_ENABLE_RADIXSHMEM=1 on one node: one or two DP scheduler
 processes, one radix-server, one shared transfer engine.
 
 For every ``dp_size`` in the parametrization:
@@ -70,7 +70,7 @@ def _dp_proc(dp_client_id: int, dp_size: int, server_id: str, config_path: str,
     # therefore on the gpu_register_port the TE listens on).
     recv_port = f"ipc:///tmp/flexkv_{server_id}"
     os.environ.update({
-        "FLEXKV_RADIX_SHMEM": "1",
+        "FLEXKV_ENABLE_RADIXSHMEM": "1",
         "FLEXKV_RADIXSHMEM_CONFIG_PATH": config_path,
         "FLEXKV_ENABLE_MPS": "0",
         "FLEXKV_SERVER_RECV_PORT": recv_port,
@@ -80,7 +80,7 @@ def _dp_proc(dp_client_id: int, dp_size: int, server_id: str, config_path: str,
     from flexkv.common.request import KVResponseStatus
     from flexkv.kvmanager import KVManager
 
-    GLOBAL_CONFIG_FROM_ENV.radix_shmem = True
+    GLOBAL_CONFIG_FROM_ENV.enable_radixshmem = True
     GLOBAL_CONFIG_FROM_ENV.radixshmem_config_path = config_path
     GLOBAL_CONFIG_FROM_ENV.enable_mps = False
     GLOBAL_CONFIG_FROM_ENV.server_recv_port = recv_port

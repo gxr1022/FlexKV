@@ -1,6 +1,6 @@
 # FlexKV radixshmem mode, one node (no etcd, no RDMA).
 #
-#   export FLEXKV_RADIX_SHMEM=1
+#   export FLEXKV_ENABLE_RADIXSHMEM=1
 #   export FLEXKV_RADIXSHMEM_CONFIG_PATH=$PWD/examples/radixshmem_configs/radixshmem_single_node.yaml
 #   export FLEXKV_CPU_LAYOUT=BLOCKFIRST
 #

@@ -62,8 +62,8 @@ class KVManager:
         else:
             self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
-        self.use_radix_shmem = GLOBAL_CONFIG_FROM_ENV.radix_shmem
-        if self.use_radix_shmem and cache_config.enable_remote:
+        self.enable_radixshmem = GLOBAL_CONFIG_FROM_ENV.enable_radixshmem
+        if self.enable_radixshmem and cache_config.enable_remote:
             # CacheEngineRadixShmem indexes the CPU tier in shm and reaches
             # peers over RDMA; but the 3rd-party (PCFS) tier has its own
             # Redis-published index and GET planner.
@@ -71,12 +71,12 @@ class KVManager:
                 "radix_shmem and enable_remote (3rd-party remote storage) "
                 "cannot be enabled at the same time"
             )
-        if self.use_radix_shmem and cache_config.enable_ssd:
+        if self.enable_radixshmem and cache_config.enable_ssd:
             raise ValueError(
                 "radix_shmem backs the CPU tier only (index + SlotStore + peer "
                 "pull); set ssd_cache_gb=0 / enable_ssd=False"
             )
-        if self.use_radix_shmem and (cache_config.enable_p2p_cpu
+        if self.enable_radixshmem and (cache_config.enable_p2p_cpu
                                      or cache_config.enable_p2p_ssd):
             # Peer reuse is the radix-server's (etcd + RDMA), switched on by the
             # radixshmem YAML making the cluster distributed; the Redis-backed
@@ -89,7 +89,7 @@ class KVManager:
         # Prefix of this host's radix regions and TE channels: the YAML's
         # cluster_id (plus the node name when several nodes share the host).
         self._shm_radix_id = None
-        if self.use_radix_shmem:
+        if self.enable_radixshmem:
             from flexkv.common.radixshmem_config import get_radixshmem_config
             self._shm_radix_id = get_radixshmem_config().local_id
 
@@ -99,12 +99,12 @@ class KVManager:
 
         )
 
-        if self.use_radix_shmem:
+        if self.enable_radixshmem:
             flexkv_logger.info(f"[KVManager] radix_shmem is enabled"
                                f"[KVManager] shm_radix_id: {self._shm_radix_id}")
 
         # Multi-instance mode also requires server_client_mode
-        if self.use_radix_shmem:
+        if self.enable_radixshmem:
             # Force server_client_mode False — KVServer is bypassed entirely.
             self.server_client_mode = False
         else:
@@ -133,7 +133,7 @@ class KVManager:
             f"local_dp_client_id={self.local_dp_client_id}, "
             f"server_client_mode={self.server_client_mode}, "
             f"server_launch_mode={self.server_launch_mode}, "
-            f"use_radix_shmem={self.use_radix_shmem}"
+            f"enable_radixshmem={self.enable_radixshmem}"
         )
 
         self.redis_meta_client = None
@@ -148,7 +148,7 @@ class KVManager:
         self.kv_task_engine = None
         self.server_handle = None
 
-        if self.use_radix_shmem:
+        if self.enable_radixshmem:
             self._init_radix_shmem_path(event_collector)
         elif self.server_client_mode:
             if self.server_launch_mode == "embedded" and dp_client_id == 0:
@@ -215,7 +215,7 @@ class KVManager:
             if self.local_dp_client_id == 0:
                 self._bootstrap_radix_shmem()
 
-            # KVTaskEngine reads GLOBAL_CONFIG_FROM_ENV.radix_shmem and builds a
+            # KVTaskEngine reads GLOBAL_CONFIG_FROM_ENV.enable_radixshmem and builds a
             # RadixShmemCacheEngine (CPU tier = RadixClient on the radix-server).
             self.kv_task_engine = KVTaskEngine(
                 self.model_config, self.cache_config,

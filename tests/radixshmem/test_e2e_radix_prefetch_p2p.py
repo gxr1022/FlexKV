@@ -114,7 +114,7 @@ def _node_proc(rank, gpu_id, cluster_id, config_path,
     # node name appended through the same override).
     recv_port = f"ipc:///tmp/flexkv_{cluster_id}_{node_name}"
     os.environ.update({
-        "FLEXKV_RADIX_SHMEM": "1",
+        "FLEXKV_ENABLE_RADIXSHMEM": "1",
         "FLEXKV_RADIXSHMEM_CONFIG_PATH": config_path,
         # The two per-node overrides of the global file: etcd keys membership
         # by node identity, which defaults to the bind IP the co-located nodes
@@ -130,7 +130,7 @@ def _node_proc(rank, gpu_id, cluster_id, config_path,
 
     # Built from env at import time; set the fields that matter explicitly in
     # case a parent import happened earlier in this process.
-    GLOBAL_CONFIG_FROM_ENV.radix_shmem = True
+    GLOBAL_CONFIG_FROM_ENV.enable_radixshmem = True
     GLOBAL_CONFIG_FROM_ENV.radixshmem_config_path = config_path
     GLOBAL_CONFIG_FROM_ENV.radix_node_name = node_name
     GLOBAL_CONFIG_FROM_ENV.radix_rpc_address = "127.0.0.1"

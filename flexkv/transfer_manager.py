@@ -381,7 +381,7 @@ class TransferManager:
         recompute_cache_block_counts(self.model_config, self.cache_config)
 
         radix_client = None
-        if GLOBAL_CONFIG_FROM_ENV.radix_shmem:
+        if GLOBAL_CONFIG_FROM_ENV.enable_radixshmem:
             from flexkv.common.radixshmem_config import get_radixshmem_config
             from flexkv.server.shm_radix_bootstrap import (attach_radix_client,
                                                            radix_index_name)

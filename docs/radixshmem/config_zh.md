@@ -21,7 +21,7 @@
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `FLEXKV_RADIX_SHMEM` | `0` | 模式总开关。`1` 时 CPU 层由 radixshmem 承担，KVServer 不启动，每个 DP 进程各建一个 KVTaskEngine 并 attach 共享的 radix 区域。在 `flexkv` 首次 import 前设置。 |
+| `FLEXKV_ENABLE_RADIXSHMEM` | `0` | 模式总开关。`1` 时 CPU 层由 radixshmem 承担，KVServer 不启动，每个 DP 进程各建一个 KVTaskEngine 并 attach 共享的 radix 区域。在 `flexkv` 首次 import 前设置。 |
 | `FLEXKV_RADIXSHMEM_CONFIG_PATH` | 空 | 第 2 节 YAML 的路径。为空时所有键取默认值。 |
 | `FLEXKV_RADIX_SERVER_LAUNCH_MODE` | `embedded` | `embedded`：dp0 进程以子进程方式启动 radix-server；`external`：attach 运维已启动的 radix-server。 |
 | `FLEXKV_RADIX_NODE_NAME` | 空 | per-node 覆盖，见 3.3。生产部署不设。 |
@@ -180,7 +180,7 @@ client:
 每个节点：
 
 ```bash
-export FLEXKV_RADIX_SHMEM=1
+export FLEXKV_ENABLE_RADIXSHMEM=1
 export FLEXKV_RADIXSHMEM_CONFIG_PATH=/etc/flexkv/radixshmem.yaml
 export FLEXKV_CPU_LAYOUT=BLOCKFIRST
 ```

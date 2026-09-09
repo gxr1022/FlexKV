@@ -1314,8 +1314,8 @@ def _swa_global_engine(swa_slots: int = 2 * SWA_W,
     from flexkv.common.config import CacheConfig, ModelConfig, SWAPoolConfig
 
     rcfg = _radix_config(cluster_id=f"swaplanner{os.getpid()}")
-    saved = {"radix_shmem": GLOBAL_CONFIG_FROM_ENV.radix_shmem}
-    GLOBAL_CONFIG_FROM_ENV.radix_shmem = True
+    saved = {"enable_radixshmem": GLOBAL_CONFIG_FROM_ENV.enable_radixshmem}
+    GLOBAL_CONFIG_FROM_ENV.enable_radixshmem = True
     set_radixshmem_config(rcfg)
 
     server = None

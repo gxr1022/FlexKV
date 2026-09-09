@@ -821,7 +821,7 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # KVServer). Everything else about that mode -- cluster membership, RDMA
     # devices, prefetch limits -- is the YAML at FLEXKV_RADIXSHMEM_CONFIG_PATH
     # (flexkv.common.radixshmem_config; reference docs/radixshmem/config_zh.md).
-    radix_shmem=bool(int(os.getenv('FLEXKV_RADIX_SHMEM', 0))),
+    enable_radixshmem=bool(int(os.getenv('FLEXKV_ENABLE_RADIXSHMEM', 0))),
     radixshmem_config_path=os.getenv('FLEXKV_RADIXSHMEM_CONFIG_PATH', '') or None,
     # embedded: the bootstrap DP process launches the radix-server subprocess;
     # external: a radix-server started by the operator is attached to.

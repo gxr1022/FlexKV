@@ -177,7 +177,7 @@ class KVTaskManager:
         # radixshmem prefetch jobs in flight: task_id -> shmradix GetJob. Polled
         # in _update_tasks, the thread every other task mutation runs on.
         self.prefetch_jobs: Dict[int, Any] = {}
-        if GLOBAL_CONFIG_FROM_ENV.radix_shmem:
+        if GLOBAL_CONFIG_FROM_ENV.enable_radixshmem:
             # The CPU tier is a radix-server (shared index + SlotStore); its
             # planners are a GlobalCacheEngine subclass.
             from flexkv.cache.radix_shmem_planner import RadixShmemCacheEngine
