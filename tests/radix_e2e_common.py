@@ -91,10 +91,21 @@ def stop_private_etcd(proc, workdir) -> None:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def sweep_radix_files(shm_radix_id: str) -> None:
-    """Drop what a run under ``shm_radix_id`` may have left in shm / tmp."""
-    for pattern in (f"/dev/shm/*{shm_radix_id}*", f"/dev/hugepages/*{shm_radix_id}*",
-                    f"/tmp/flexkv_{shm_radix_id}*"):
+def write_radix_config(workdir: str, config: dict, name: str = "radixshmem.yaml") -> str:
+    """Write the run's radixshmem YAML (``FLEXKV_RADIXSHMEM_CONFIG_PATH``) and
+    return its path."""
+    import yaml
+    path = os.path.join(workdir, name)
+    with open(path, "w") as f:
+        yaml.safe_dump(config, f)
+    return path
+
+
+def sweep_radix_files(cluster_id: str) -> None:
+    """Drop what a run under ``cluster_id`` (the radixshmem namespace; every
+    shm / socket / IPC name of the run contains it) may have left in shm / tmp."""
+    for pattern in (f"/dev/shm/*{cluster_id}*", f"/dev/hugepages/*{cluster_id}*",
+                    f"/tmp/flexkv_{cluster_id}*"):
         for stale in glob.glob(pattern):
             with contextlib.suppress(OSError):
                 os.unlink(stale)

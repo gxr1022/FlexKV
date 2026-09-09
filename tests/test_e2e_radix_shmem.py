@@ -6,7 +6,10 @@ For every ``dp_size`` in the parametrization:
   * dp0 is the bootstrap process: its KVManager launches the radix-server
     (index + SlotStore, the node's CPU KV pool) and spawns the single TE; every
     other DP attaches to both by name and feeds the TE over its own shm
-    channel with a disjoint graph/op id range.
+    channel with a disjoint graph/op id range. The run's namespace is the
+    ``cluster.cluster_id`` of a small YAML written per run
+    (FLEXKV_RADIXSHMEM_CONFIG_PATH), which is how a deployment names its
+    regions too.
   * Phase 1: every DP PUTs its own requests concurrently through the shared TE.
   * Phase 2 (dp_size > 1): dp0 PUTs a prefix that dp1 then finds with
     ``get_match`` -- the shared index is what the radixshmem path exists for.
@@ -27,6 +30,8 @@ from __future__ import annotations
 import contextlib
 import multiprocessing as mp
 import os
+import shutil
+import tempfile
 import time
 
 import numpy as np
@@ -44,6 +49,7 @@ from radix_e2e_common import (
     sweep_radix_files,
     wait_kv_manager_ready,
     write_pattern,
+    write_radix_config,
 )
 
 NUM_GPU_BLOCKS = 256
@@ -56,7 +62,8 @@ SHARED_START_BLOCK = 128
 ROUNDTRIP_START_BLOCK = 192
 
 
-def _dp_proc(dp_client_id: int, dp_size: int, server_id: str, barrier, result_q) -> None:
+def _dp_proc(dp_client_id: int, dp_size: int, server_id: str, config_path: str,
+             barrier, result_q) -> None:
     """Full lifecycle of one DP scheduler process."""
     # Before the first flexkv import: GLOBAL_CONFIG_FROM_ENV is read at import.
     # All DP procs share one TE, so they must agree on server_recv_port (and
@@ -64,7 +71,7 @@ def _dp_proc(dp_client_id: int, dp_size: int, server_id: str, barrier, result_q)
     recv_port = f"ipc:///tmp/flexkv_{server_id}"
     os.environ.update({
         "FLEXKV_RADIX_SHMEM": "1",
-        "FLEXKV_SHM_RADIX_ID": server_id,
+        "FLEXKV_RADIXSHMEM_CONFIG_PATH": config_path,
         "FLEXKV_ENABLE_MPS": "0",
         "FLEXKV_SERVER_RECV_PORT": recv_port,
     })
@@ -74,7 +81,7 @@ def _dp_proc(dp_client_id: int, dp_size: int, server_id: str, barrier, result_q)
     from flexkv.kvmanager import KVManager
 
     GLOBAL_CONFIG_FROM_ENV.radix_shmem = True
-    GLOBAL_CONFIG_FROM_ENV.shm_radix_id = server_id
+    GLOBAL_CONFIG_FROM_ENV.radixshmem_config_path = config_path
     GLOBAL_CONFIG_FROM_ENV.enable_mps = False
     GLOBAL_CONFIG_FROM_ENV.server_recv_port = recv_port
 
@@ -177,11 +184,15 @@ def _dp_proc(dp_client_id: int, dp_size: int, server_id: str, barrier, result_q)
 
 def _run(dp_size: int) -> dict:
     server_id = f"e2e{dp_size}dp_{os.getpid()}"
+    workdir = tempfile.mkdtemp(prefix="flexkv_radix_e2e_")
+    config_path = write_radix_config(workdir, {"cluster": {"cluster_id": server_id},
+                                               "data": {"prefault": False}})
     ctx = mp.get_context("spawn")
     barrier = ctx.Barrier(dp_size)
     result_q = ctx.Queue()
     procs = [
-        ctx.Process(target=_dp_proc, args=(dp, dp_size, server_id, barrier, result_q),
+        ctx.Process(target=_dp_proc,
+                    args=(dp, dp_size, server_id, config_path, barrier, result_q),
                     daemon=False)
         for dp in range(dp_size)
     ]
@@ -204,6 +215,7 @@ def _run(dp_size: int) -> dict:
                 proc.terminate()
                 proc.join(timeout=10)
         sweep_radix_files(server_id)
+        shutil.rmtree(workdir, ignore_errors=True)
     return reports
 
 

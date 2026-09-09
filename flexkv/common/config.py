@@ -787,61 +787,21 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     server_launch_mode=os.getenv('FLEXKV_SERVER_LAUNCH_MODE', 'embedded').lower(),
     server_recv_port=os.getenv('FLEXKV_SERVER_RECV_PORT', 'ipc:///tmp/flexkv_server'),
 
-    # Multi-DP via radixshmem (cache_engine in each DP scheduler proc, single TE
-    # via shm channel IPC). When True, KVServer is not started; each DP process
-    # builds its own KVTaskEngine and attaches to shared radix regions.
+    # radixshmem mode: the CPU tier is radixshmem's index + SlotStore, one
+    # radix-server per node, one shared TE, a KVTaskEngine per DP process (no
+    # KVServer). Everything else about that mode -- cluster membership, RDMA
+    # devices, prefetch limits -- is the YAML at FLEXKV_RADIXSHMEM_CONFIG_PATH
+    # (flexkv.common.radixshmem_config; reference docs/radixshmem/config_zh.md).
     radix_shmem=bool(int(os.getenv('FLEXKV_RADIX_SHMEM', 0))),
-    # Names this FlexKV's radix shm regions and TE shm channels; pass it only to
-    # tell apart several FlexKV instances sharing one node.
-    shm_radix_id=os.getenv('FLEXKV_SHM_RADIX_ID', 'flexkv'),
-    radix_world_size=int(os.getenv('FLEXKV_RADIX_WORLD_SIZE', 1)),
-    # etcd endpoint carrying cluster membership, e.g. "etcd://10.0.0.1:2379".
-    # SHMRADIX_CLUSTER_ID is only the BASE namespace: each tier rendezvouses in
-    # "<base>_<tier>" (shm_radix_bootstrap.cluster_id_for).
-    radix_registry=os.getenv('FLEXKV_RADIX_REGISTRY', ''),
-    # Bootstrap IP peers dial, required when world_size > 1 (interface wins when
-    # both are set); a concrete per-node address, since it also derives the identity.
-    radix_rpc_address=os.getenv('FLEXKV_RADIX_RPC_ADDRESS', ''),
-    radix_rpc_interface=os.getenv('FLEXKV_RADIX_RPC_INTERFACE', ''),
-    # HCA of the index control plane (radixshmem ClusterConfig.index_dev); the
-    # data plane's HCAs are FLEXKV_RADIX_TRANSFER_DEV (comma separated, empty =
-    # every device mooncake finds).
-    radix_index_dev=os.getenv('FLEXKV_RADIX_INDEX_DEV',
-                              os.getenv('FLEXKV_RADIX_RDMA_DEV', '')),
-    radix_transfer_devices=[d for d in
-                            os.getenv('FLEXKV_RADIX_TRANSFER_DEV', '').split(',') if d],
-    radix_gid_idx=int(os.getenv('FLEXKV_RADIX_GID_IDX', 3)),
-    # etcd namespace (radix/<cluster_id>/...) and this node's identity; the
-    # SHMRADIX_* spellings are what radixshmem itself reads.
-    radix_cluster_id=os.getenv('FLEXKV_RADIX_CLUSTER_ID',
-                               os.getenv('SHMRADIX_CLUSTER_ID', 'default')),
-    radix_node_name=os.getenv('FLEXKV_RADIX_NODE_NAME',
-                              os.getenv('SHMRADIX_NODE_NAME', '')),
-    # RHT slots per bucket: 1 is a blind overwrite that defeats peer routing.
-    radix_rht_slots=int(os.getenv('FLEXKV_RADIX_RHT_SLOTS',
-                                  os.getenv('SHMRADIX_RHT_SLOTS', 4))),
+    radixshmem_config_path=os.getenv('FLEXKV_RADIXSHMEM_CONFIG_PATH', '') or None,
     # embedded: the bootstrap DP process launches the radix-server subprocess;
     # external: a radix-server started by the operator is attached to.
     radix_server_launch_mode=os.getenv('FLEXKV_RADIX_SERVER_LAUNCH_MODE', 'embedded').lower(),
-    # gRPC endpoint override; empty = unix:///dev/shm/<index name>.sock.
-    radix_endpoint=os.getenv('FLEXKV_RADIX_ENDPOINT', ''),
-    # MAP_POPULATE the SlotStore at server start (predictable D2H latency, pages
-    # placed by the server process's NUMA policy).
-    radix_prefault=bool(int(os.getenv('FLEXKV_RADIX_PREFAULT', 1))),
-    # Server-side deadline of one prefetch pull; the job completes with the local
-    # hit when it expires. sglang's FlexKV path has no prefetch timeout of its own.
-    radix_prefetch_timeout_ms=int(os.getenv('FLEXKV_RADIX_PREFETCH_TIMEOUT_MS', 5000)),
-    # Peer pulls in flight per CE process before new prefetches skip the peer
-    # walk (kept under radixshmem's max_outstanding so get_async never blocks).
-    radix_prefetch_max_inflight=int(os.getenv('FLEXKV_RADIX_PREFETCH_MAX_INFLIGHT', 128)),
-    # Index DataPool sizing factor (radixshmem IndexConfig.data_pool_ratio).
-    radix_data_pool_ratio=float(os.getenv('FLEXKV_RADIX_DATA_POOL_RATIO', 8.0)),
-    radix_bootstrap_timeout_sec=int(os.getenv(
-        'FLEXKV_RADIX_BOOTSTRAP_TIMEOUT_SEC', 120
-    )),
-    # Control-plane transport for remote ops: "zmq" (TCP) or "dc" (RDMA DC,
-    # needs mlx5). Rank 0 is authoritative and broadcasts its choice.
-    radix_remote_op_transport=os.getenv('FLEXKV_RADIX_REMOTE_OP_TRANSPORT', 'dc'),
+    # Per-node overrides of the global YAML, for several nodes on one host
+    # (tests): the node's etcd identity and the bootstrap IP peers dial. Unset
+    # in a real deployment, where both derive from cluster.rpc_interface.
+    radix_node_name=os.getenv('FLEXKV_RADIX_NODE_NAME', ''),
+    radix_rpc_address=os.getenv('FLEXKV_RADIX_RPC_ADDRESS', ''),
 
     index_accel=bool(int(os.getenv('FLEXKV_INDEX_ACCEL', 1))),
     cpu_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_CPU_LAYOUT', 'BLOCKFIRST').upper()),

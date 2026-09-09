@@ -382,10 +382,11 @@ class TransferManager:
 
         radix_client = None
         if GLOBAL_CONFIG_FROM_ENV.radix_shmem:
+            from flexkv.common.radixshmem_config import get_radixshmem_config
             from flexkv.server.shm_radix_bootstrap import (attach_radix_client,
                                                            radix_index_name)
             radix_client = attach_radix_client(
-                radix_index_name(GLOBAL_CONFIG_FROM_ENV.shm_radix_id))
+                radix_index_name(get_radixshmem_config().local_id))
             self._radix_client = radix_client
         self.storage_engine = StorageEngine(
             self.model_config,

@@ -953,7 +953,12 @@ class GlobalCacheEngine:
 
         self.index_accel = GLOBAL_CONFIG_FROM_ENV.index_accel
         self.use_radix_shmem = GLOBAL_CONFIG_FROM_ENV.radix_shmem
-        self._shm_radix_id = GLOBAL_CONFIG_FROM_ENV.shm_radix_id
+        # Prefix of this host's radix regions (the YAML's cluster_id, plus the
+        # node name for co-located nodes); None outside radixshmem mode.
+        self._shm_radix_id = None
+        if self.use_radix_shmem:
+            from flexkv.common.radixshmem_config import get_radixshmem_config
+            self._shm_radix_id = get_radixshmem_config().local_id
         if cache_config.enable_kv_sharing and not self.use_radix_shmem:
             assert redis_meta is not None
             self.redis_meta = redis_meta
@@ -2254,7 +2259,9 @@ class GlobalCacheEngine:
         if not engine.peer_enabled:
             return self._empty_get_return(request_id)
         inflight = self.radix_prefetch_inflight()
-        max_inflight = GLOBAL_CONFIG_FROM_ENV.radix_prefetch_max_inflight
+        from flexkv.common.radixshmem_config import get_radixshmem_config
+        client_settings = get_radixshmem_config().client
+        max_inflight = client_settings.prefetch_max_inflight
         if inflight >= max_inflight:
             flexkv_logger.debug(
                 f"radixshmem prefetch {request_id}: {inflight} peer pulls in flight "
@@ -2266,7 +2273,7 @@ class GlobalCacheEngine:
             sequence_meta,
             component_mask=mask,
             query_end=block_mask_end,
-            timeout_ms=GLOBAL_CONFIG_FROM_ENV.radix_prefetch_timeout_ms,
+            timeout_ms=client_settings.prefetch_timeout_ms,
         )
         plan = self._empty_get_return(request_id)
         if job is None:

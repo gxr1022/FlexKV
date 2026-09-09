@@ -61,6 +61,13 @@ from flexkv.server.client import KVTPClient
 from flexkv.transfer.layerwise import build_layerwise_eventfd_socket_path
 from flexkv.transfer_manager import TransferManagerOnRemote
 
+
+def _radixshmem_distributed() -> bool:
+    """Whether the radixshmem YAML describes a cluster (peer pulls possible)."""
+    from flexkv.common.radixshmem_config import get_radixshmem_config
+    return get_radixshmem_config().distributed
+
+
 logger = logging.getLogger(__name__)
 
 _SGLANG_REQ_ID_UNSET = object()
@@ -316,8 +323,7 @@ class FlexKVConnector:
             or self.cache_config.enable_kv_sharing
             # radixshmem cluster: prefetch is where a peer's blocks are pulled
             # into this node (RadixClient.get_async); GET then matches locally.
-            or (GLOBAL_CONFIG_FROM_ENV.radix_shmem
-                and GLOBAL_CONFIG_FROM_ENV.radix_world_size > 1)
+            or (GLOBAL_CONFIG_FROM_ENV.radix_shmem and _radixshmem_distributed())
         )
         self._shutdown_done = False
 

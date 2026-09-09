@@ -8,16 +8,20 @@ the RDMA transfer engine and the etcd data-plane entry. In this mode FlexKV
 neither allocates CPU KV memory nor moves bytes between nodes itself:
 
   * the bootstrap DP process (instance 0, dp 0) launches the server from the
-    FlexKV configuration (``FLEXKV_RADIX_SERVER_LAUNCH_MODE=embedded``) or
-    expects one started by the operator (``external``);
+    FlexKV configuration -- geometry from ``CacheConfig``, everything else from
+    the YAML at ``FLEXKV_RADIXSHMEM_CONFIG_PATH`` (``flexkv.common.radixshmem_config``)
+    -- (``FLEXKV_RADIX_SERVER_LAUNCH_MODE=embedded``) or expects one started by
+    the operator (``external``);
   * every DP scheduler process, the TE process and its transfer workers attach
     with ``shmradix.RadixClient(name)``: index operations, ``store`` (the
     SlotStore mapping) and ``get_async`` (the server-side peer pull).
 
-Naming: index ``/shmradix_<shm_radix_id>_cpu``. A cluster node's index gets
-``_<node_name>`` appended by radixshmem itself and is resolved through the gRPC
-socket ``/dev/shm/shmradix_<shm_radix_id>_cpu.sock``, so attachers only need
-the base name. The SlotStore is ``<index>_data``.
+Naming: index ``/shmradix_<local_id>_cpu`` where ``local_id`` is the YAML's
+``cluster.cluster_id`` (plus ``_<node_name>`` when FLEXKV_RADIX_NODE_NAME names
+one of several co-located nodes). A cluster node's index gets ``_<node_name>``
+appended by radixshmem itself and is resolved through the gRPC socket
+``/dev/shm/shmradix_<local_id>_cpu.sock``, so attachers only need the base
+name. The SlotStore is ``<index>_data``.
 
 Geometry: FlexKV stays the source of slot counts and slot bytes. One FULL slot
 holds exactly one CPU block as ``StorageEngine`` lays it out (BLOCKFIRST: all
@@ -40,6 +44,7 @@ import torch
 from flexkv.common.config import (GLOBAL_CONFIG_FROM_ENV, CacheConfig, LayerGroupSpec,
                                   ModelConfig, SWAPoolConfig)
 from flexkv.common.debug import flexkv_logger
+from flexkv.common.radixshmem_config import RadixShmemConfig, get_radixshmem_config
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 
 try:
@@ -67,17 +72,18 @@ def _ensure_shmradix() -> None:
                 f"surface of radixshmem (transfer-server branch or later)")
 
 
-def radix_index_name(shm_radix_id: str) -> str:
-    """Base shm name of the CPU tier's index; it also names the gRPC socket."""
-    return f"{_SHM_PREFIX}_{shm_radix_id}_cpu"
+def radix_index_name(local_id: str) -> str:
+    """Base shm name of the CPU tier's index for ``local_id``
+    (``RadixShmemConfig.local_id``); it also names the gRPC socket."""
+    return f"{_SHM_PREFIX}_{local_id}_cpu"
 
 
-def radix_data_name(shm_radix_id: str) -> str:
-    return radix_index_name(shm_radix_id) + "_data"
+def radix_data_name(local_id: str) -> str:
+    return radix_index_name(local_id) + "_data"
 
 
-def radix_socket_path(shm_radix_id: str) -> str:
-    return "/dev/shm/" + radix_index_name(shm_radix_id).lstrip("/").replace("/", "_") + ".sock"
+def radix_socket_path(local_id: str) -> str:
+    return "/dev/shm/" + radix_index_name(local_id).lstrip("/").replace("/", "_") + ".sock"
 
 
 # ------------------------------------------------------------------ geometry
@@ -274,81 +280,46 @@ def check_geometry(client: "shmradix.RadixClient", expected: RadixGeometry,
 
 # ------------------------------------------------------------- server config
 
-def _cluster_kwargs(world_size: int) -> Dict[str, Any]:
-    env = GLOBAL_CONFIG_FROM_ENV
-    names = {f.name for f in dataclasses.fields(shmradix.ClusterConfig)}
-    kw: Dict[str, Any] = dict(
-        expected_min_nodes=world_size if world_size > 1 else 0,
-        registry=env.radix_registry or "etcd://127.0.0.1:2379",
-        cluster_id=env.radix_cluster_id,
-        node_name=env.radix_node_name,
-        rpc_address=env.radix_rpc_address,
-        rpc_interface=env.radix_rpc_interface,
-        gid_idx=env.radix_gid_idx,
-        bootstrap_timeout_sec=env.radix_bootstrap_timeout_sec,
-        rht_slots_per_bucket=env.radix_rht_slots,
-        remote_op_transport=env.radix_remote_op_transport,
-    )
-    # The index control plane's HCA was renamed rdma_dev -> index_dev in radixshmem.
-    kw["index_dev" if "index_dev" in names else "rdma_dev"] = env.radix_index_dev
-    return {k: v for k, v in kw.items() if k in names}
-
-
 def build_radix_server_config(model_config: ModelConfig,
                               cache_config: CacheConfig,
-                              shm_radix_id: str,
-                              *,
-                              evict_ratio: float = 0.05,
-                              background_evict: bool = True) -> "shmradix.RadixServerConfig":
+                              rcfg: Optional[RadixShmemConfig] = None,
+                              ) -> "shmradix.RadixServerConfig":
     """The one radix-server this FlexKV node needs: index sized from
     ``cache_config`` (FULL slots = ``num_cpu_blocks``, SWA slots = ``swa.num_slots``),
-    SlotStore sized so that every slot is exactly one block, cluster settings
-    from ``FLEXKV_RADIX_*``. Raises on an inconsistent configuration."""
+    SlotStore sized so that every slot is exactly one block, and the cluster /
+    data-plane / index / server settings of ``rcfg`` (default: the process's
+    ``FLEXKV_RADIXSHMEM_CONFIG_PATH``) passed through. Raises on an
+    inconsistent configuration."""
     _ensure_shmradix()
-    env = GLOBAL_CONFIG_FROM_ENV
-    world_size = int(env.radix_world_size)
-    if world_size > 1:
-        if not env.radix_registry:
-            raise ValueError(
-                "radixshmem distributed mode needs an etcd registry "
-                "(FLEXKV_RADIX_REGISTRY, e.g. 'etcd://10.0.0.1:2379'): it is the only "
-                "cluster bootstrap path shmradix has")
-        if not env.radix_rpc_address and not env.radix_rpc_interface:
-            raise ValueError(
-                "radixshmem distributed mode needs FLEXKV_RADIX_RPC_ADDRESS or "
-                "FLEXKV_RADIX_RPC_INTERFACE: the bootstrap IP peers dial, which also "
-                "derives this node's identity; give every node a concrete address of "
-                "its own (co-located nodes: 127.0.0.1, 127.0.0.2, ... or a distinct "
-                "FLEXKV_RADIX_NODE_NAME), never 0.0.0.0")
+    if rcfg is None:
+        rcfg = get_radixshmem_config()
     geo = expected_geometry(model_config, cache_config)
     index = shmradix.IndexConfig(
-        name=radix_index_name(shm_radix_id),
+        name=radix_index_name(rcfg.local_id),
         tokens_per_block=geo.tokens_per_block,
         full_slots=geo.full_slots,
         swa_slots=geo.swa_slots,
         swa_window_blocks=geo.swa_window_blocks,
-        background_evict_ratio=(evict_ratio if background_evict else 0.0),
-        data_pool_ratio=float(env.radix_data_pool_ratio),
+        **rcfg.index,
     )
     data = shmradix.DataPlaneConfig(
         data_bytes=geo.data_bytes,
         full_slot_bytes=geo.full_slot_bytes,
         swa_slot_bytes=geo.swa_slot_bytes,
         slot_align=geo.slot_align,
-        data_name=radix_data_name(shm_radix_id),
-        prefault=bool(env.radix_prefault),
-        transfer_devices=list(env.radix_transfer_devices),
+        data_name=radix_data_name(rcfg.local_id),
+        **rcfg.data,
     )
-    cluster = shmradix.ClusterConfig(**_cluster_kwargs(world_size))
-    hugepage_path = ""
-    if cache_config.use_hugepage_cpu_buffer:
-        hugepage_path = os.environ.get("FLEXKV_HUGETLBFS_DIR", DEFAULT_HUGETLBFS_DIR)
-    cfg = shmradix.RadixServerConfig(index=index, data=data, cluster=cluster,
-                                     hugepage_path=hugepage_path, endpoint=env.radix_endpoint)
+    cluster = shmradix.ClusterConfig(**rcfg.cluster)
+    server_kwargs = dict(rcfg.server)
+    if not server_kwargs.get("hugepage_path") and cache_config.use_hugepage_cpu_buffer:
+        server_kwargs["hugepage_path"] = os.environ.get("FLEXKV_HUGETLBFS_DIR",
+                                                        DEFAULT_HUGETLBFS_DIR)
+    cfg = shmradix.RadixServerConfig(index=index, data=data, cluster=cluster, **server_kwargs)
     flexkv_logger.info(
-        f"radixshmem server config for {radix_index_name(shm_radix_id)}: {geo.describe()}, "
-        f"world_size={world_size}, hugepage_path={hugepage_path or '(shm)'}, "
-        f"prefault={data.prefault}")
+        f"radixshmem server config for {index.name}: {geo.describe()}, "
+        f"{rcfg.describe()}, hugepage_path={cfg.hugepage_path or '(shm)'}, "
+        f"prefault={data.prefault}, transfer_devices={data.transfer_devices or '(all)'}")
     return cfg
 
 
@@ -411,7 +382,7 @@ class RadixServerProcess:
 
     def start(self, timeout_s: Optional[float] = None) -> "RadixServerProcess":
         if timeout_s is None:
-            timeout_s = float(GLOBAL_CONFIG_FROM_ENV.radix_bootstrap_timeout_sec) + 60.0
+            timeout_s = float(self.cfg.cluster.bootstrap_timeout_sec) + 60.0
         parent, child = self._ctx.Pipe(duplex=False)
         self.process = self._ctx.Process(
             target=_radix_server_main,
@@ -465,18 +436,23 @@ class RadixServerProcess:
 def attach_radix_client(name: str,
                         timeout_s: Optional[float] = None,
                         *,
-                        max_outstanding: int = 256) -> "shmradix.RadixClient":
+                        rcfg: Optional[RadixShmemConfig] = None,
+                        max_outstanding: Optional[int] = None) -> "shmradix.RadixClient":
     """``shmradix.RadixClient(name)``, retried until the server's socket exists
     and the server is ready (an embedded server starts concurrently with the
-    CEs, an external one may still be rendezvousing).
+    CEs, an external one may still be rendezvousing). Endpoint, timeout and
+    ``max_outstanding`` default to ``rcfg`` (the process's configuration).
 
     The returned client owns the index attach, the SlotStore mapping and the
     gRPC channel; keep it alive for as long as its slots are addressed.
     """
     _ensure_shmradix()
-    env = GLOBAL_CONFIG_FROM_ENV
+    if rcfg is None:
+        rcfg = get_radixshmem_config()
     if timeout_s is None:
-        timeout_s = float(env.radix_bootstrap_timeout_sec) + 60.0
+        timeout_s = rcfg.attach_timeout_s
+    if max_outstanding is None:
+        max_outstanding = rcfg.client.max_outstanding
     deadline = time.monotonic() + timeout_s
     last: Optional[BaseException] = None
     while True:
@@ -485,7 +461,7 @@ def attach_radix_client(name: str,
             raise TimeoutError(
                 f"radix-server {name} not attachable within {timeout_s:.0f}s: {last}")
         try:
-            return shmradix.RadixClient(name, endpoint=env.radix_endpoint or None,
+            return shmradix.RadixClient(name, endpoint=rcfg.endpoint or None,
                                         timeout_s=max(1.0, remaining),
                                         max_outstanding=max_outstanding)
         except Exception as e:  # noqa: BLE001 - socket not there yet, server starting

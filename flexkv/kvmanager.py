@@ -75,7 +75,12 @@ class KVManager:
                 "radix_shmem backs the CPU tier only (index + SlotStore + peer "
                 "pull); set ssd_cache_gb=0 / enable_ssd=False"
             )
-        self._shm_radix_id = GLOBAL_CONFIG_FROM_ENV.shm_radix_id
+        # Prefix of this host's radix regions and TE channels: the YAML's
+        # cluster_id (plus the node name when several nodes share the host).
+        self._shm_radix_id = None
+        if self.use_radix_shmem:
+            from flexkv.common.radixshmem_config import get_radixshmem_config
+            self._shm_radix_id = get_radixshmem_config().local_id
 
         flexkv_logger.info(
             f"[KVManager] IPC ports: server_recv_port={self.server_recv_port}, "
@@ -241,9 +246,7 @@ class KVManager:
                 f"got {launch_mode!r}"
             )
         if launch_mode == "embedded":
-            server_cfg = build_radix_server_config(
-                self.model_config, self.cache_config, self._shm_radix_id
-            )
+            server_cfg = build_radix_server_config(self.model_config, self.cache_config)
             self._shm_radix_server = RadixServerProcess(server_cfg).start()
             self.cache_config.distributed_node_id = int(
                 self._shm_radix_server.cluster_rank)
@@ -252,9 +255,10 @@ class KVManager:
                 f"cluster rank {self.cache_config.distributed_node_id}"
             )
         else:
+            from flexkv.common.radixshmem_config import get_radixshmem_config
             flexkv_logger.info(
                 f"[kv manager] attaching to an external radix-server at "
-                f"{GLOBAL_CONFIG_FROM_ENV.radix_endpoint or radix_socket_path(self._shm_radix_id)}"
+                f"{get_radixshmem_config().endpoint or radix_socket_path(self._shm_radix_id)}"
             )
 
         # One shm channel per DP client (instance_num * dp_size).

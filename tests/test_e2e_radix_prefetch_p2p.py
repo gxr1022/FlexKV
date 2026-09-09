@@ -5,9 +5,11 @@ Two full FlexKV nodes on one host (two processes, two GPUs), one radixshmem
 cluster:
 
   * each node's KVManager launches its own radix-server (index + SlotStore =
-    the node's CPU pool + RDMA transfer engine) under a distinct
-    FLEXKV_SHM_RADIX_ID; the two servers rendezvous in one etcd namespace
-    (FLEXKV_RADIX_WORLD_SIZE=2), get dense cluster ranks and an RHT to route by;
+    the node's CPU pool + RDMA transfer engine) from one shared YAML
+    (FLEXKV_RADIXSHMEM_CONFIG_PATH: cluster_id, expected_min_nodes=2, registry,
+    RDMA devices), told apart by the per-node FLEXKV_RADIX_NODE_NAME override
+    as co-located nodes are; the two servers rendezvous in one etcd namespace,
+    get dense cluster ranks and an RHT to route by;
   * node 0 PUTs a window of GPU blocks holding a per-block pattern;
   * node 1 calls ``KVManager.prefetch_async`` for the same tokens: the index walk
     finds the prefix on node 0 over RDMA, node 1's radix-server RDMA-reads the
@@ -32,6 +34,8 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
+import shutil
+import tempfile
 import time
 
 import numpy as np
@@ -53,6 +57,7 @@ from radix_e2e_common import (
     sweep_radix_files,
     wait_kv_manager_ready,
     write_pattern,
+    write_radix_config,
 )
 
 WORLD_SIZE = 2
@@ -66,8 +71,8 @@ SEED_A = 0x5EED
 SEED_B = 0xBEEF
 
 
-def _node_tag(run_id: str, rank: int) -> str:
-    return f"{run_id}_r{rank}"
+def _node_name(rank: int) -> str:
+    return f"r{rank}"
 
 
 def _prefetch_until(kvm, token_ids, want_pulled_blocks: int, timeout: float = 60.0):
@@ -98,29 +103,24 @@ def _prefetch_until(kvm, token_ids, want_pulled_blocks: int, timeout: float = 60
     return pulled, rounds
 
 
-def _node_proc(rank, gpu_id, run_id, registry, cluster_id, rdma_dev,
+def _node_proc(rank, gpu_id, cluster_id, config_path,
                reader_ready, written, read_done, result_q):
     """One FlexKV node: rank 0 writes the windows, rank 1 prefetches and reads."""
     # Before any CUDA context exists: each node drives a different device while
     # addressing it as device 0.
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    node_tag = _node_tag(run_id, rank)
-    recv_port = f"ipc:///tmp/flexkv_{node_tag}"
+    node_name = _node_name(rank)
+    # FlexKV's own IPC names are per node too (its radix regions get the
+    # node name appended through the same override).
+    recv_port = f"ipc:///tmp/flexkv_{cluster_id}_{node_name}"
     os.environ.update({
         "FLEXKV_RADIX_SHMEM": "1",
-        "FLEXKV_SHM_RADIX_ID": node_tag,
-        "FLEXKV_RADIX_WORLD_SIZE": str(WORLD_SIZE),
-        "FLEXKV_RADIX_REGISTRY": registry,
-        # One etcd namespace per run keeps concurrent runs apart.
-        "FLEXKV_RADIX_CLUSTER_ID": cluster_id,
-        # etcd keys membership by node identity, which defaults to the bind IP
-        # the co-located nodes share -- so name each node.
-        "FLEXKV_RADIX_NODE_NAME": node_tag,
+        "FLEXKV_RADIXSHMEM_CONFIG_PATH": config_path,
+        # The two per-node overrides of the global file: etcd keys membership
+        # by node identity, which defaults to the bind IP the co-located nodes
+        # share -- so name each node and give the loopback address explicitly.
+        "FLEXKV_RADIX_NODE_NAME": node_name,
         "FLEXKV_RADIX_RPC_ADDRESS": "127.0.0.1",
-        "FLEXKV_RADIX_INDEX_DEV": rdma_dev,
-        "FLEXKV_RADIX_TRANSFER_DEV": rdma_dev,
-        "FLEXKV_RADIX_RHT_SLOTS": "4",
-        "FLEXKV_RADIX_PREFAULT": "0",
         "FLEXKV_ENABLE_MPS": "0",
         "FLEXKV_SERVER_RECV_PORT": recv_port,
         "FLEXKV_TRACE_RADIX_PEER": "1",
@@ -132,16 +132,9 @@ def _node_proc(rank, gpu_id, run_id, registry, cluster_id, rdma_dev,
     # Built from env at import time; set the fields that matter explicitly in
     # case a parent import happened earlier in this process.
     GLOBAL_CONFIG_FROM_ENV.radix_shmem = True
-    GLOBAL_CONFIG_FROM_ENV.shm_radix_id = node_tag
-    GLOBAL_CONFIG_FROM_ENV.radix_world_size = WORLD_SIZE
-    GLOBAL_CONFIG_FROM_ENV.radix_registry = registry
-    GLOBAL_CONFIG_FROM_ENV.radix_cluster_id = cluster_id
-    GLOBAL_CONFIG_FROM_ENV.radix_node_name = node_tag
+    GLOBAL_CONFIG_FROM_ENV.radixshmem_config_path = config_path
+    GLOBAL_CONFIG_FROM_ENV.radix_node_name = node_name
     GLOBAL_CONFIG_FROM_ENV.radix_rpc_address = "127.0.0.1"
-    GLOBAL_CONFIG_FROM_ENV.radix_index_dev = rdma_dev
-    GLOBAL_CONFIG_FROM_ENV.radix_transfer_devices = [rdma_dev]
-    GLOBAL_CONFIG_FROM_ENV.radix_rht_slots = 4
-    GLOBAL_CONFIG_FROM_ENV.radix_prefault = False
     GLOBAL_CONFIG_FROM_ENV.enable_mps = False
     GLOBAL_CONFIG_FROM_ENV.server_recv_port = recv_port
 
@@ -238,8 +231,19 @@ def _node_proc(rank, gpu_id, run_id, registry, cluster_id, rdma_dev,
 
 
 def _run(registry: str, rdma_dev: str) -> dict:
-    run_id = f"p2p{os.getpid()}"
-    cluster_id = f"flexkv_p2p_{os.getpid()}"
+    # One etcd namespace (and shm prefix) per run keeps concurrent runs apart.
+    cluster_id = f"p2p{os.getpid()}"
+    workdir = tempfile.mkdtemp(prefix="flexkv_radix_p2p_")
+    config_path = write_radix_config(workdir, {
+        "cluster": {
+            "cluster_id": cluster_id,
+            "expected_min_nodes": WORLD_SIZE,
+            "registry": registry,
+            "index_dev": rdma_dev,
+            "rht_slots_per_bucket": 4,
+        },
+        "data": {"transfer_devices": [rdma_dev], "prefault": False},
+    })
     ctx = mp.get_context("spawn")
     reader_ready, written, read_done = ctx.Event(), ctx.Event(), ctx.Event()
     result_q = ctx.Queue()
@@ -249,7 +253,7 @@ def _run(registry: str, rdma_dev: str) -> dict:
         for rank in range(WORLD_SIZE):
             proc = ctx.Process(
                 target=_node_proc,
-                args=(rank, rank, run_id, registry, cluster_id, rdma_dev,
+                args=(rank, rank, cluster_id, config_path,
                       reader_ready, written, read_done, result_q),
                 daemon=False,
             )
@@ -269,8 +273,8 @@ def _run(registry: str, rdma_dev: str) -> dict:
             if proc.is_alive():
                 proc.terminate()
                 proc.join(timeout=10)
-        for rank in range(WORLD_SIZE):
-            sweep_radix_files(_node_tag(run_id, rank))
+        sweep_radix_files(cluster_id)
+        shutil.rmtree(workdir, ignore_errors=True)
     return reports
 
 
