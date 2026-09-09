@@ -1,6 +1,6 @@
 # FlexKV × radixshmem 集成（多 DP 路径）
 
-将 FlexKV 的多 DP 路径从 "N 个 CE 客户端 → zmq → 单 KVServer 进程" 改造为 "N 个 CE 在自己地址空间里 attach 同一段共享 shm radix tree、并行查询，1 个共享 TE 通过 N 条 ShmChannel 接收 transfer graph"。结果是端到端 mean 时延快 **~3.4×**（中位）/最坏 ~2×、QPS 高 **~80%**（中位）/最坏 ~50%、命中率不变，并且消除 baseline 路径下高 QPS 时观察到的多种 hang/race。
+将 FlexKV 的多 DP 路径从 "N 个 CE 客户端 → zmq → 单 KVServer 进程" 改造为 "N 个 CE 在自己地址空间里 attach 同一段共享 shm radix tree、并行查询，1 个共享 TE 通过 N 条 ShmChannel 接收 transfer graph"。结果是端到端 mean 时延快 **~3.4×**（中位）/最坏 ~2×、QPS 高 **~80%**（中位）/最坏 ~50%、命中率不变，并且消除 baseline 路径下高 QPS 时观察到的多种 hang/race（测量细节见 git 历史中的两阶段 benchmark）。
 
 ## 目录
 
@@ -8,11 +8,8 @@
 2. [架构](#2-架构)
 3. [编译与依赖](#3-编译与依赖)
 4. [启用方法 / 配置项](#4-启用方法--配置项)
-5. [对比 baseline 的方法](#5-对比-baseline-的方法)
-6. [高压力测试结果](#6-高压力测试结果)
-7. [正确性验证](#7-正确性验证)
-8. [配套脚本清单](#8-配套脚本清单)
-9. [已知坑](#9-已知坑)
+5. [容量估算](#5-容量估算以-qwen3-8b8-dp-为例)
+6. [已知坑](#6-已知坑)
 
 ---
 
@@ -44,7 +41,7 @@ FlexKV 端做了三件事：
 | **Cache 跨 DP 共享** | ✅ 通过单 KVServer 共享 | ✅ 通过共享 shm tree |
 | **Query 路径无 N→1 漏斗** | ❌ 所有查询过单 server | ✅ 每 DP 在自己进程并行 |
 
-vllm 自带 `--enable-prefix-caching` 是 per-DP GPU-local 的，**两条维度都没有**（路由命中只有 1/DP 概率），所以在 multi-DP 高 QPS 下比 baseline FlexKV 还慢一个量级（见 §6 三路对比）。
+vllm 自带 `--enable-prefix-caching` 是 per-DP GPU-local 的，**两条维度都没有**（路由命中只有 1/DP 概率），所以在 multi-DP 高 QPS 下比 baseline FlexKV 还慢一个量级。
 
 ---
 
@@ -61,14 +58,13 @@ DP scheduler 进程 0   ...   DP scheduler 进程 N-1
            │                            │
         ┌──┴────────────────────────────┴──┐
         ▼                                  ▼
-  /dev/shm/<id>_cpu (radixshmem)   ── 所有 CE 直接读写
-  /dev/shm/<id>_ssd  (radixshmem)
-  /dev/shm/<id>_remote (radixshmem)
+  /dev/shm/shmradix_<id>_cpu       (radix 索引)   ── 所有 CE 直接读写
+  /dev/shm/shmradix_<id>_cpu_data  (SlotStore = CPU KV 池) ── TE / worker 按名字 attach
         │                                  │
         ▼ ShmChannel × N (SPSC ring + futex)
   ┌──────────────────────────────────────────┐
   │  TransferEngine 进程（单实例）           │
-  │  - StorageEngine (CPU buf / SSD / GPU)   │
+  │  - StorageEngine (SlotStore 视图 / GPU)  │
   │  - 多通道 selector loop                  │
   └──────────────────────────────────────────┘
 ```
@@ -131,37 +127,7 @@ pip install -e . --no-build-isolation
 
 依赖：Cython（构建时）、torch、numpy、xxhash、liburing、expiring_dict、zmq、redis 等。详见 `requirements.txt`。
 
-### 3.3 容器化部署（vllm/vllm-openai 镜像）
-
-vllm 官方镜像 `vllm/vllm-openai:vX.X.X` 不含 FlexKV 和它的 native 依赖。常用做法是 bind-mount 源码进容器，并跑一次性 setup 脚本：
-
-```bash
-# 先把 radixshmem (dev 分支) clone 到 /path/to/radixshmem
-git clone -b dev ssh://git@gitlab-master.nvidia.com:12051/zhuofanl/radixshmem.git /path/to/radixshmem
-
-# 创建容器（注意 --shm-size，见 §4.4 / §6.1 容量算法）
-docker run -d --name dp-shm-test \
-    --network host --shm-size=400g --gpus all \
-    -v /path/to/FlexKV:/work/FlexKV \
-    -v /path/to/radixshmem:/work/radixshmem \
-    -v /path/to/data:/work/data \
-    --entrypoint sleep \
-    vllm/vllm-openai:vX.X.X \
-    infinity
-
-# 一次性 setup：符号链接 liburing、装 expiring_dict、验证 import
-# 内容参考 benchmarks/two_phase/setup_container.sh
-docker exec dp-shm-test bash /path/to/setup_container.sh
-```
-
-**setup_container.sh 做的事**：
-1. 从 `mooncake_transfer_engine.libs/liburing-*.so.2` 软链接到 `/usr/lib/x86_64-linux-gnu/liburing.so.2`（FlexKV c_ext 在这找）
-2. `pip install expiring_dict`
-3. `python3 -c "import flexkv; import shmradix"` 验证
-
-> 容器**每次重启后都要再跑一次 setup**（写在容器 rootfs，不在 bind mount）。
-
-### 3.4 运行时 Python path
+### 3.3 运行时 Python path
 
 ```bash
 export PYTHONPATH=/work/FlexKV:/work/radixshmem/python:$PYTHONPATH
@@ -178,7 +144,7 @@ export LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/torch/lib:$LD_LIB
 export FLEXKV_RADIX_SHMEM=1
 export FLEXKV_SHM_RADIX_ID=<unique-id>     # 同机多 vllm 实例时区分用
 export FLEXKV_DP_SIZE=8                    # 必须跟 vllm --data-parallel-size 一致
-export FLEXKV_CPU_CACHE_GB=200             # CPU cache 大小，见 §6.1
+export FLEXKV_CPU_CACHE_GB=200             # CPU cache 大小，见 §5
 ```
 
 `FLEXKV_RADIX_SHMEM=1` 时 `KVManager` 走 `use_radix_shmem=True` 分支，每个 DP 进程内部构造 `KVTaskEngine`，绕过 `KVServer.create_server()`。Bootstrap DP（`instance_id=0 && dp_client_id=0`）拉起本节点的 radix-server 子进程（索引 + SlotStore = CPU 池）并 spawn 共享 TE；其它 DP attach。
@@ -215,7 +181,7 @@ vllm serve <model_path> \
 | `--data-parallel-size N` | ✅ | 跟 `FLEXKV_DP_SIZE` 对齐 |
 | `--no-enable-prefix-caching` | 强烈建议 | 关掉 vllm 自带 prefix cache，让 FlexKV 路径独占；否则两层 cache 混在一起难评估 |
 | `--kv-transfer-config '{...}'` | ✅ | 启用 FlexKV connector |
-| `--gpu-memory-utilization` | 看卡 | 留 KV cache 余量，见 §6.1 |
+| `--gpu-memory-utilization` | 看卡 | 留 KV cache 余量，见 §5 |
 
 ### 4.3 验证生效
 
@@ -244,80 +210,7 @@ export FLEXKV_NUM_LOG_INTERVAL_REQUESTS=100   # 命中率日志频率
 
 ---
 
-## 5. 对比 baseline 的方法
-
-### 5.1 切换 baseline / shmradix / vllm-only 三种模式
-
-| 模式 | 关键开关 |
-|---|---|
-| **baseline**（FlexKV + zmq + 单 KVServer） | `FLEXKV_RADIX_SHMEM=0` + `--kv-transfer-config FlexKVConnectorV1` + `--no-enable-prefix-caching` |
-| **shmradix**（FlexKV + 共享 shm tree） | `FLEXKV_RADIX_SHMEM=1` + 同上 |
-| **vllm-only**（无 FlexKV，仅 vllm 原生 prefix cache） | 去掉 `--kv-transfer-config` + 加 `--enable-prefix-caching`（不是 `--no-enable-prefix-caching`） |
-
-### 5.2 测试 workload — 两阶段 prefix-reuse
-
-为暴露多 DP 高 QPS + 高 prefix 复用场景下三种路径的差异，我们用一个固定的两阶段 workload：
-
-- **Phase 1（warmup）**：固定生成 8192 个 prompt（每个 128 token，token id 用固定 seed 随机生成），低并发 c=32 推进去。phase 1 结束后所有 prefix 都落到 CPU cache 里。
-- **Phase 1 ↔ Phase 2 之间 sleep 15s** 让 FlexKV 异步 PUT 落库。
-- **Phase 2（measure）**：同样 8192 个 prompt，每个在 phase 1 原 prompt 后接 10 个新 token（128 → 138 tokens，理论命中率 = 128/138 = 92.7%）。两组配置：
-  - **R1**：open-loop QPS 目标 2048，`max_tokens=8`（含少量 decode）
-  - **R2**：open-loop QPS 目标 4096，`max_tokens=1`（极限压力，最小化 decode 占比）
-
-每条 phase 2 请求理论上能命中 phase 1 同 index 那条的全部 8 个 16-token block。
-
-### 5.3 一键脚本
-
-```bash
-# 1. FlexKV baseline
-WHICH=baseline REGEN_DATASET=1 CPU_CACHE_GB=200 \
-PHASE2_QPS=4096 PHASE2_MAX_TOKENS=1 \
-OUT_DIR=/tmp/run1 \
-bash benchmarks/two_phase/run_two_phase_bench.sh
-
-# 2. 重启容器清 /dev/shm（PID 1 不 reap，POSIX shm 不会自动释放）
-docker stop <container> && docker start <container>
-bash benchmarks/two_phase/setup_container.sh
-
-# 3. FlexKV shmradix（同一个 OUT_DIR）
-WHICH=shmradix REGEN_DATASET=0 CPU_CACHE_GB=200 \
-PHASE2_QPS=4096 PHASE2_MAX_TOKENS=1 \
-OUT_DIR=/tmp/run1 \
-bash benchmarks/two_phase/run_two_phase_bench.sh
-
-# 4. 重启容器 + setup
-docker stop <container> && docker start <container>
-bash benchmarks/two_phase/setup_container.sh
-
-# 5. vllm-only（独立 OUT_DIR，一次跑 phase1+R1+R2）
-OUT_DIR=/tmp/run1_vllm_only \
-bash benchmarks/two_phase/run_vllm_only_bench.sh
-
-# 6. 三路分析
-python3 benchmarks/two_phase/analyze_three_way.py \
-    --baseline-result   /tmp/run1/phase2-baseline.json \
-    --baseline-log      /tmp/run1/vllm-baseline.log \
-    --baseline-marker   /tmp/run1/phase2-baseline.start_marker \
-    --shmradix-result   /tmp/run1/phase2-shmradix.json \
-    --shmradix-log      /tmp/run1/vllm-shmradix.log \
-    --shmradix-marker   /tmp/run1/phase2-shmradix.start_marker \
-    --vllm-only-result  /tmp/run1_vllm_only/phase2-vllm_only-r2.json \
-    --vllm-only-log     /tmp/run1_vllm_only/vllm-vllm_only.log \
-    --vllm-only-marker  /tmp/run1_vllm_only/phase2-vllm_only-r2.start_marker \
-    --label R2
-```
-
-整套耗时 35-45 分钟（3 次 vllm 启动 + 3 次 phase1+phase2 + 3 次容器重启）。
-
----
-
-## 6. 高压力测试结果
-
-测试环境：H20 单机 8 × GPU，2 TB RAM，容器 `--shm-size=400g`。Qwen3-8B（36 layers / 8 KV heads / head_dim=128 / bf16）。
-
-> 以下数据在 CPU 池还由 FlexKV 自己分配时测得；换成 radix-server 的 SlotStore 后 H2D/D2H 的地址和步长完全相同，只是内存的拥有者变了。
-
-### 6.1 容量账（先把数算清楚）
+## 5. 容量估算（以 Qwen3-8B、8 DP 为例）
 
 ```
 per_token_KV = num_kv_heads × head_dim × 2(K+V) × dtype_bytes × num_layers
@@ -328,9 +221,7 @@ per_block_KV = per_token_KV × block_size (16) = 2.25 MB
 
 | 项 | 大小 | 备注 |
 |---|---:|---|
-| **CPU cache 配置** (`FLEXKV_CPU_CACHE_GB`) | 200 GB | |
-| Phase 1 工作集 | 8192 × 128 × 144 KB | **147 GB**（75 % 占用，无 eviction） |
-| Phase 2 新增 token 量 | < 2 GB | 多数是 partial block，PUT 量小 |
+| **CPU cache 配置** (`FLEXKV_CPU_CACHE_GB`) | 200 GB | 全部落在 radix-server 的 SlotStore（`/dev/shm` 或 hugetlbfs） |
 | GPU 每卡物理容量 | ~143 GB | H20 |
 | vllm 占用 (`--gpu-memory-utilization 0.28`) | ~40 GB / 卡 | |
 | 模型权重 (Qwen3-8B bf16) | ~16 GB / 卡 | |
@@ -338,158 +229,23 @@ per_block_KV = per_token_KV × block_size (16) = 2.25 MB
 | 每卡 GPU KV 容量 | ~170 K tokens / ~10 600 blocks | 24 GB / 144 KB |
 | 8 DP 合计 GPU KV | ~192 GB | 每 DP 独立、不共享 |
 
-**关键观察**：phase 1 之后单卡 GPU 上有约 131K tokens 的 prefix KV（占 77 %）。vllm 自带 prefix cache **有充分容量本钱**，但 vllm v1 默认 DP 路由是**纯负载均衡**（不是 prefix-aware，见 `vllm/v1/engine/core_client.py:1337` 的 `DPLBAsyncMPClient.get_core_engine_for_request`），所以 phase 2 的请求落到原 DP 的概率 ≈ 1/8 = 12.5 %。这就是 vllm-only 路径性能塌的根因。
 
-### 6.2 R2 高压极限（QPS=4096，max_tokens=1）
-
-> **测量版本**：以下数据为删除 `flexkv/transfer/worker.py` 里 D2H/H2D worker 多余的 `torch.cuda.synchronize()` 之后（参见 §9 第 10 项）重测。表中 baseline / shmradix 列为 **5 次独立 run 的中位数**（每次 run 之间 `docker stop && start` 容器以重置 /dev/shm 和 GPU/SHM 状态）。`vllm-only` 不走 FlexKV transfer 路径，沿用原单次测量。
->
-> **shmradix 的尾延迟和 mean 时延有 bimodal 抽样**：5 次 run 里 2 次落在 fast 簇（mean ~250-300ms / p99 ~400-500ms），3 次落在 slow 簇（mean ~700-940ms / p99 ~1100-1420ms）。两簇都比 baseline 显著快，但具体倍数随 run 漂移。baseline 自己只有 ±7% 单峰噪声（因为单 KVServer 串行 query 锁住了节奏，把 GPU scheduling 噪声平掉了）。
-
-| Metric | baseline | shmradix | vllm-only | shmradix vs baseline |
-|---|---:|---:|---:|---:|
-| wall (s) | 4.4 | **2.5** | 13.22 | **−43 %** |
-| **observed QPS** | 1867 | **3305** | **620** | **+77 %** |
-| lat mean (ms) | 1867 | **544** | 5994 | **−71 %** |
-| lat p50 (ms) | 1941 | **545** | 5894 | −72 % |
-| lat p95 (ms) | 2660 | **780** | 10856 | −71 % |
-| lat p99 (ms) | 2819 | **884** | 11036 | −69 % |
-| **FlexKV hit %** | **90.68** | **90.68** | n/a | 完全相同 |
-| qtime get mean (µs) | 1859 | **151** | n/a | −91.9 % |
-| qtime put mean (µs) | 932 | **68** | n/a | −92.7 % |
-
-> 三个 backend 都是 8186 ok / 6 empty / 0 err。vllm-only 比 baseline 慢 3.2 ×，比 shmradix 慢 11 ×。
->
-> qtime（match/put_match 时延）来自 FlexKV query 路径，与被删除的 transfer 端 sync 无关，沿用原 R2 数。
-
-**5 次 run 原始数据**：
-
-| run | backend | wall | QPS | mean | p99 |
-|---|---|---:|---:|---:|---:|
-| 1 | baseline | 4.2 | 1938 | 1728 | 2612 |
-| 2 | baseline | 4.5 | 1824 | 2018 | 2929 |
-| 3 | baseline | 4.5 | 1815 | 1867 | 2866 |
-| 4 | baseline | 4.3 | 1916 | 1743 | 2679 |
-| 5 | baseline | 4.3 | 1884 | 1869 | 2771 |
-| 1 | shmradix | 2.6 | 3206 | 709 | 1116 |
-| 2 | shmradix | 2.7 | 3039 | 815 | 1286 |
-| 3 | shmradix | **2.3** | **3618** | **245** | **419** |
-| 4 | shmradix | 2.8 | 2965 | 941 | 1419 |
-| 5 | shmradix | **2.3** | **3571** | **273** | **482** |
-
-baseline 5 run 标准差 ≈ ±5%，shmradix 双峰：fast (run3/5) vs slow (run1/2/4)。**即便最坏 shmradix (run4: mean=941) 仍比最好 baseline (run1: mean=1728) 快 1.8 ×**。
-
-### 6.3 R1 标准压力（QPS=2048，max_tokens=8）
-
-> R1 未重测；以下为含 sync 的旧数。删除 sync 对 R1 的影响方向与 R2 一致（baseline 全线 ~10%，shmradix 尾延迟 ~12%），相对关系（shmradix vs baseline）变化幅度有限。
-
-| Metric | baseline | shmradix | vllm-only | shmradix vs baseline |
-|---|---:|---:|---:|---:|
-| wall (s) | 4.83 | 4.21 | 14.26 | −12.8 % |
-| observed QPS | 1696 | 1944 | **574** | +14.6 % |
-| lat mean (ms) | 933 | **165** | 7487 | **−82.3 %** |
-| lat p50 (ms) | 978 | **124** | 7374 | −87.3 % |
-| lat p95 (ms) | 1493 | **460** | 10866 | −69.2 % |
-| FlexKV hit % | 90.68 | 90.68 | n/a | 完全相同 |
-| qtime get mean (µs) | 1457 | 176 | n/a | −87.9 % |
-
-### 6.4 三路对比小结
-
-| 维度 | baseline | shmradix | vllm-only |
-|---|---|---|---|
-| Cache 储存位置 | CPU pinned + GPU | CPU pinned + GPU | **GPU only** |
-| Cache 跨 DP 共享？ | ✅ 是（单 KVServer） | ✅ 是（POSIX shm tree） | ❌ **否** |
-| Cache 容量上限 | 200 GB（CPU） | 200 GB（CPU） | ~24 GB / DP |
-| Query 路径 | zmq → 单 server 串行 | per-DP 本地直查 shm | vllm 进程内 |
-| Multi-DP 实际命中率 | 90.68 % | **90.68 %** | **~12.5 %（1/DP 上限）** |
-| QPS 上限（R2 中位） | ~1870 | **~3300**（fast 簇 ~3600） | ~620 |
-
-### 6.5 关键结论
-
-1. **shmradix 和 baseline 命中率完全相同（90.68 %）** —— 二者之间的差距全部来自 query 路径
-2. **baseline QPS 上限 ≈ 1870**（5 run 中位；range 1815-1938）—— 单 KVServer 串行处理的硬上限，方差小
-3. **shmradix QPS 中位 ≈ 3300**，最坏 ~2965（slow 簇），最好 ~3618（fast 簇），是 baseline 的 **1.6-2.0 ×**；mean 时延中位是 baseline 的 0.29 ×（**3.4 × 更快**），最坏也快 **1.8 ×**
-4. **vllm-only QPS 上限 ≈ 620**（R1/R2 都是），是 baseline 的 0.33 ×、shmradix 的 0.19 × —— 不是因为 vllm 慢，是 multi-DP 路由让 GPU prefix cache 命中率塌
-5. **baseline 的 `get_match` 时延随负载剧增**（R1: 1457 µs → R2: 1859 µs），shmradix **完全不随负载变化**（R1: 176 µs → R2: 151 µs）—— scaling 本质区别
-6. **FlexKV 在 multi-DP serving 下的两条独立价值**：(a) cache 跨 DP 共享带来命中率优势；(b) query 路径去 N→1 漏斗带来时延/QPS 优势。shmradix 在 baseline (a) 的基础上再加 (b)
-7. **shmradix 在 R2 的 bimodal 现象**：query 路径成本 ~150µs 之后，整个端到端时延几乎全由 GPU scheduling 决定。max_tokens=1 + 4096 QPS open-loop 突发场景下，开局如何把第一波请求摊到 8 个 DP 上对 cascade 影响极大，因此抽样会落在两种稳态之一。baseline 因为 query 慢（1.8 ms × 1900/s ≈ 3.4 ms backlog 增长/s）相当于内置 rate limiter，反而让 GPU scheduling 不容易跑歪
 
 ---
 
-## 7. 正确性验证
-
-用真实 ShareGPT 多轮对话数据集（50 conversations × 3 turns = 150 个 request 每后端）。本节数据为 §6.2 §10 项 sync 删除后、最新 rebase 代码（含 `c10e5af use numpy buffers in hashing path`）上重新验证的结果。
-
-### 7.1 输出可用性
-
-verifier 跑五项垃圾检查：replacement char、控制字符、低熵、private-use unicode、空串。
-
-| 后端 | turn | ok | empty | err | **garbled** | 平均长度 (chars) |
-|---|---:|---:|---:|---:|---:|---:|
-| baseline | 1 / 2 / 3 | 50 / 50 / 50 | 0 / 0 / 0 | 0 / 0 / 0 | **0 / 0 / 0** | 306 / 315 / 315 |
-| **shmradix** | 1 / 2 / 3 | **50 / 50 / 50** | 0 / 0 / 0 | 0 / 0 / 0 | **0 / 0 / 0** | 304 / 315 / 311 |
-
-两边都 150/150 ok，**0 garbled / 0 empty / 0 error**。抽样输出都是切题英文，turn 2/3 显式延续 turn 1 上下文（"continue explaining"、"asking about the get(i) method I provided earlier"），KV cache 命中后模型行为完全正常。
-
-### 7.2 KV cache 真实复用（H2D 证据）
-
-`verify_correctness.py` 在 multiturn + phase1 start-marker 时间窗内统计 FlexKV worker 的 H2D 完成事件（每行 = 一次真实 CPU→GPU `cudaMemcpyAsync`）。
-
-| 后端 | H2D 事件数 | 总传输 (GB) | 平均带宽 (GB/s) | hit ratio (窗内) |
-|---|---:|---:|---:|---:|
-| baseline | 256 | **150.510** | 29.26 | 46.70 % |
-| shmradix | 730 | **150.510** | 25.58 | 46.70 % |
-
-两边**总搬运字节完全相等（150.510 GB）**且**命中率完全相等（46.70%）**，证明 FlexKV 命中**不是仅 metadata 命中**，是真把 KV bytes 从 CPU pinned buffer cudaMemcpy 回 GPU 槽。事件数不同因为 shmradix 路径会把同一组 block 拆得更细（更多小 op），但物理 IO 总量恒等。带宽 25-29 GB/s 是 H20 PCIe 正常范围。
-
-### 7.3 跨后端输出一致性
-
-| 维度 | 值 |
-|---|---|
-| 比较的 (conv, turn) 单元格 | 150 |
-| 文本完全相同 | 112 (74.7 %) |
-| 不同但都合理 | 38 (25.3 %) |
-| 乱码 | **0** |
-
-差异都是 CUDA kernel 非确定性 + DP-server 自然负载均衡导致的换词（同 backend 重跑两次也有 ~10-15 % 漂移）。所有差异样本都是**前缀几乎一致，后段分支选词不同**。
-
----
-
-## 8. 配套脚本清单
-
-测试基础设施全部在 `benchmarks/two_phase/`：
-
-| 文件 | 作用 |
-|---|---|
-| `setup_container.sh` | 容器重建/重启后一次性 setup（liburing 软链接、装 expiring_dict、import 验证） |
-| `gen_dataset.py` | 生成 phase1/phase2 token JSON（参数全 CLI 化：n-convs、seq-len、extension-len、seed 等） |
-| `run_phase1_warmup.py` | phase 1 closed-loop ThreadPool driver |
-| `run_phase2_bench.py` | phase 2 driver，支持 `--mode qps`（open-loop asyncio）或 `--mode concurrency`（closed-loop） |
-| `correctness_multiturn.py` | ShareGPT 多轮 driver（正确性验证用） |
-| `verify_correctness.py` | 五项垃圾检查 + H2D 字节统计 + 跨后端 diff |
-| `run_two_phase_bench.sh` | FlexKV 路径一键 orchestrator（`WHICH=baseline/shmradix/both`） |
-| `run_vllm_only_bench.sh` | vllm-only 路径一键 orchestrator（关 FlexKV、开 vllm 原生 prefix cache） |
-| `analyze_phase2.py` | baseline vs shmradix 两路对比分析 |
-| `analyze_three_way.py` | baseline / shmradix / vllm-only 三路对比分析 |
-| `README.md` | 工具自身文档（参数表 + 容量陷阱 + 推荐 workflow） |
-
----
-
-## 9. 已知坑
+## 6. 已知坑
 
 | 坑 | 现象 | 处理 |
 |---|---|---|
-| 1. 容器 PID 1 是 `sleep infinity` 不 reap zombie | 两个 vllm session 间 `/dev/shm` 卡满（~200 GB 残留） | `docker stop && start` 容器，然后再跑 `setup_container.sh` |
 | 2. `pkill -f "vllm serve"` 杀不全 | 留下 `VLLM::EngineCore_*` 子进程 | 同时 `pkill -f "VLLM::"` |
 | 3. vllm v1 默认路由不是 prefix-aware | r2 落 r1 当时 DP 的概率仅 1/N | 这正是 shmradix 的价值；不要试图修 vllm 端 |
-| 4. vllm 官方镜像不含 FlexKV | 重建容器后 import 失败 | 跑 `setup_container.sh`，或在 Dockerfile 里加 install 步骤 |
 | 5. `docker stop` 报 "did not receive an exit event" | 看着像没停 | 等 30-90 秒，容器自然变 Exited(137) |
 | 6. vllm 不把所有 env 传给 engine 子进程 | 自定义 `FLEXKV_*` env 在 engine 进程里 `os.getenv` 拿不到 | env 的 default 行为只继承一部分；FlexKV 已用 `FlexKVConfig.from_env` 序列化进 config；若新加 env 需要 lazy resolve |
 | 7. `--shm-size` 一旦设定，container restart 不能改 | 修不了 | `docker rm` 重建 |
 | 8. `FLEXKV_SHM_RADIX_ID` 重复 | 多个 vllm 实例 attach 同一段 shm tree，状态串了 | 每个实例用唯一 ID |
 | 8b. `/dev/shm` 容量 | CPU KV 池整体是 radix-server 建在 `/dev/shm` 的 SlotStore：容器 `--shm-size` 小于 `cpu_cache_gb` 时 radix-server 起不来 | `--shm-size` ≥ `cpu_cache_gb` + 余量；或 `use_hugepage_cpu_buffer: true` + `FLEXKV_HUGETLBFS_DIR` 走 hugetlbfs |
 | 8c. `attached radixshmem regions do not match FlexKV's configuration` | TE 算出的 CPU 块字节数 / 块数与 DP-0 启动 radix-server 时不同 | 日志里有两边的数值；多 PP 不均分或 DSv4 sidecar 组没在 KVManager 之前记录时会出现 |
-| 9. CPU cache 跨 DP 共享、但 GPU KV cache 是 per-DP | 容易混淆容量估算 | 见 §6.1，CPU 是 200 GB 共池，GPU 是 8 × 24 GB 独立 |
+| 9. CPU cache 跨 DP 共享、但 GPU KV cache 是 per-DP | 容易混淆容量估算 | 见 §5，CPU 是 200 GB 共池，GPU 是 8 × 24 GB 独立 |
 | 10. `flexkv/transfer/worker.py` 里曾在 `_transfer_impl` 后 `torch.cuda.synchronize()` | 把 D2H/H2D op 串行成 device-wide drain，R2 mean / p95 / p99 各 ~10-12% degrade | device-wide sync 已移除；`GPUCPUTransferWorker._transfer_impl` 现把 `sync=True` 下推给 C++ `transfer_kv_blocks`，收尾只做 stream-scoped 的 `cudaStreamSynchronize(stream)`（`csrc/transfer.cu:300`），不再 drain 整个 device。下游 worker 队列自带 stream-aware 排序，多余的 device sync 没有保护任何 invariant。NIXL worker 的 sync（`worker.py:2411`，由 PR #142 引入）属于另一条路径，与本项无关 |
 
 ---
@@ -514,4 +270,4 @@ verifier 跑五项垃圾检查：replacement char、控制字符、低熵、priv
 
 - 主仓库：[`FlexKV`](https://github.com/taco-project/FlexKV)
 - radixshmem 依赖：<https://gitlab-master.nvidia.com/zhuofanl/radixshmem/-/tree/dev?ref_type=heads>（`dev` 分支）
-- 完整调试历史：本仓库 git log + 本目录下其它 dp_shmradix_*.md 文档
+- 跨节点、SWA：`radixshmem_cross_node.md`、`sglang_flexkv_radixshmem_swa.md`

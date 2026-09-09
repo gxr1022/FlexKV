@@ -1495,14 +1495,12 @@ class TransferManagerShmTEProcess:
                  cache_config: CacheConfig,
                  gpu_register_port: str,
                  server_id: str,
-                 num_channels: int,
-                 total_clients: int = 0):
+                 num_channels: int):
         self.model_config = model_config
         self.cache_config = cache_config
         self.gpu_register_port = gpu_register_port
         self.server_id = server_id
         self.num_channels = num_channels
-        self.total_clients = total_clients
 
         self.mp_ctx = mp.get_context("spawn")
         self._start_event = self.mp_ctx.Event()
@@ -1539,8 +1537,7 @@ class TransferManagerShmTEProcess:
                       self.num_channels,
                       self._start_event,
                       self._ready_event,
-                      self._stop_event,
-                      self.total_clients),
+                      self._stop_event),
                 daemon=False,
             )
             self.process.start()

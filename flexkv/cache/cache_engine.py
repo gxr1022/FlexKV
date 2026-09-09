@@ -504,12 +504,6 @@ class CacheEngineAccel:
     def set_ready(self, node: CRadixNode, ready: bool, ready_length: int) -> None:
         self.index.set_ready(node, ready, ready_length)
 
-    def release_node(self, node: CRadixNode, ready_length: int) -> None:
-        """Transfer-complete release: unlock the node and mark it ready. Paired
-        with the lock_node taken at insert/match protection time."""
-        self.unlock(node)
-        self.set_ready(node, True, ready_length)
-
     def take(self,
              num_required_blocks: int,
              protected_node: Optional[CRadixNode] = None,
@@ -3410,55 +3404,10 @@ class GlobalCacheEngine:
                 if DeviceType.REMOTE in buffer_to_free:
                     assert self.remote_cache_engine is not None
                     self.remote_cache_engine.recycle(buffer_to_free[DeviceType.REMOTE])
-            # Closure-style completion actions (radixshmem planners and the
-            # converted local/global paths): node release, buffer recycle,
-            # match-ref release -- each closure owns its own ordering.
+            # Closure-style completion actions of the radixshmem planners
+            # (staged publish, match-pin release); each closure owns its ordering.
             for action in on_complete or []:
                 action()
-
-    @staticmethod
-    def _collect_finalizers(*match_results: Optional[MatchResultAccel]) -> List[Callable]:
-        """Gather radixshmem match finalizers; process-internal tiers yield none."""
-        finalizers = (getattr(mr, "finalize", None) for mr in match_results
-                      if mr is not None)
-        return [fin for fin in finalizers if fin is not None]
-
-    def _defer_node_release(self,
-                            device_type: DeviceType,
-                            node: object,
-                            ready_length: int,
-                            is_put: bool) -> Callable[[], None]:
-        """Lock ``node`` now; return a closure that unlocks + set_ready
-        (+ PUT publish) it, to run at graph completion."""
-        engine = self.cache_engines[device_type]
-        engine.lock_node(node)
-
-        def _release() -> None:
-            if ready_length > 0:
-                engine.release_node(node, ready_length)
-            else:
-                # Unlock-only anchor (mooncake deferred commit): readiness is
-                # published later by the deferred insert, never here.
-                engine.unlock(node)
-            if not is_put:
-                return
-            if device_type == DeviceType.CPU and self.cache_config.enable_p2p_cpu:
-                engine.local_index.insert_and_publish(node)
-            elif device_type == DeviceType.SSD and self.cache_config.enable_p2p_ssd:
-                engine.local_index.insert_and_publish(node)
-            elif device_type == DeviceType.REMOTE and self.enable_kv_sharing:
-                engine.insert_and_publish(node)
-        return _release
-
-    def _defer_recycle(self,
-                       device_type: DeviceType,
-                       blocks: np.ndarray) -> Optional[Callable[[], None]]:
-        """Return a closure recycling ``blocks`` back to ``device_type``'s pool,
-        or None when there is nothing to recycle."""
-        if len(blocks) == 0:
-            return None
-        engine = self.cache_engines[device_type]
-        return lambda: engine.recycle(blocks)
 
     @_synchronized_cache_tree
     def _abort_transfer_plan(self,

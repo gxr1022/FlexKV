@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 from flexkv.cache.cache_engine import CacheStrategy, GlobalCacheEngine
-from flexkv.common.transfer import DeviceType, TransferType
+from flexkv.common.transfer import TransferType
 from flexkv.common.type import MatchResultAccel
 
 
@@ -27,14 +27,12 @@ class _FakeNode:
         return self._num_blocks
 
 
-class _FakeCacheEngine:
+class _FakeCPUCacheEngine:
     def __init__(self, capacity: int) -> None:
         self.capacity = capacity
         self.take_requests = []
         self.recycled = []
         self.inserted = []
-        self.locked = []
-        self.released = []
 
     def take(self, num_required_blocks, protected_node=None, strict=False):
         del protected_node, strict
@@ -52,12 +50,6 @@ class _FakeCacheEngine:
         size = len(physical_blocks) if num_insert_blocks is None else num_insert_blocks
         return _FakeNode(size)
 
-    def lock_node(self, node):
-        self.locked.append(node)
-
-    def release_node(self, node, ready_length=-1):
-        self.released.append((node, ready_length))
-
 
 def _match(block_ids):
     blocks = np.asarray(block_ids, dtype=np.int64)
@@ -74,10 +66,7 @@ def _match(block_ids):
 
 def _build_local_get(*, enable_gds, cpu_blocks, ssd_blocks, gpu_blocks,
                      cpu_capacity):
-    cpu_cache = _FakeCacheEngine(capacity=cpu_capacity)
-    # The SSD entry only ever sees the deferred node-release surface: a GET
-    # stages into CPU blocks, never into SSD ones.
-    ssd_cache = _FakeCacheEngine(capacity=0)
+    cpu_cache = _FakeCPUCacheEngine(capacity=cpu_capacity)
     engine = GlobalCacheEngine.__new__(GlobalCacheEngine)
     engine.cache_config = SimpleNamespace(
         enable_cpu=True,
@@ -86,8 +75,6 @@ def _build_local_get(*, enable_gds, cpu_blocks, ssd_blocks, gpu_blocks,
         enable_p2p_cpu=False,
     )
     engine.cpu_cache_engine = cpu_cache
-    engine.ssd_cache_engine = ssd_cache
-    engine.cache_engines = {DeviceType.CPU: cpu_cache, DeviceType.SSD: ssd_cache}
     engine.index_accel = False
     engine._metrics_collector = None
     engine.match_local = lambda sequence_meta, strategy: (

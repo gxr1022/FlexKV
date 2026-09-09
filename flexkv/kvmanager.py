@@ -257,15 +257,12 @@ class KVManager:
                 f"{GLOBAL_CONFIG_FROM_ENV.radix_endpoint or radix_socket_path(self._shm_radix_id)}"
             )
 
-        # Extra channels past the internal DP clients let external processes (e.g.
-        # a prefetch controller) attach at channel_ids >= total_clients.
-        total_clients = self.model_config.total_clients
+        # One shm channel per DP client (instance_num * dp_size).
         self._shm_te_process = TransferManagerShmTEProcess(
             self.model_config, self.cache_config,
             gpu_register_port=self.gpu_register_port,
             server_id=self._shm_radix_id,
-            num_channels=total_clients + GLOBAL_CONFIG_FROM_ENV.num_extra_te_channels,
-            total_clients=total_clients,
+            num_channels=self.model_config.total_clients,
         )
         self._shm_te_process.start()
 

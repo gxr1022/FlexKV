@@ -152,12 +152,10 @@ class _TEShmDispatcher:
          this after the TM has finished initializing.
     """
 
-    def __init__(self, server_id: str, num_channels: int,
-                 total_clients: int = 0):
+    def __init__(self, server_id: str, num_channels: int):
         self._tm = None
         self._server_id = server_id
         self._num_channels = num_channels
-        self._total_clients = total_clients
         self._ctrl: Optional[ShmControlBlock] = None
         self._channels: List[ShmChannel] = []
         # graph_id -> channel_id (submitter)
@@ -171,16 +169,13 @@ class _TEShmDispatcher:
         """Create shm control block + per-channel files. Idempotent w.r.t. CE
         attaches — CE-side handles only need these files to exist."""
         self._ctrl = ShmControlBlock(self._server_id, create=True)
-        # Publish the internal DP client count = first reserved external channel
-        # id, so external attachers can auto-pick a reserved slot.
-        self._ctrl.set_total_clients(self._total_clients)
         self._channels = [
             ShmChannel(self._server_id, ch_id, create=True)
             for ch_id in range(self._num_channels)
         ]
         flexkv_logger.info(
             f"TE shm dispatcher: {self._num_channels} channels created on "
-            f"server_id={self._server_id} (total_clients={self._total_clients})"
+            f"server_id={self._server_id}"
         )
 
     def start_dispatch(self, transfer_manager) -> None:
@@ -234,13 +229,6 @@ class _TEShmDispatcher:
                         )
                         continue
                     graph = m.graph
-                    # Tag prefetch graphs so the scheduler deprioritizes them
-                    # (background bucket). Internal engine channels are
-                    # 0..total_clients-1; external prefetch controllers attach at
-                    # channel_id >= total_clients (see PrefetchController). Nothing
-                    # synchronously waits on prefetch DISK2H, so it yields to
-                    # engine H2D under a submission burst.
-                    graph.is_prefetch = (ch.channel_id >= self._total_clients)
                     with self._owner_lock:
                         self._graph_owner[graph.graph_id] = ch.channel_id
                     self._tm.submit(graph)
@@ -301,8 +289,7 @@ def te_shm_main(model_config: ModelConfig,
                 num_channels: int,
                 start_event,
                 ready_event,
-                stop_event,
-                total_clients: int = 0) -> None:
+                stop_event) -> None:
     """Entrypoint for the TE subprocess in `mode="shm"`.
 
     Mirrors `TransferManagerInterProcessHandle._process_worker` but replaces
@@ -321,7 +308,7 @@ def te_shm_main(model_config: ModelConfig,
         os.environ["MPI4PY_RC_INITIALIZE"] = "false"
 
         # Phase 1: create shm channels — CE side can attach now.
-        dispatcher = _TEShmDispatcher(server_id, num_channels, total_clients)
+        dispatcher = _TEShmDispatcher(server_id, num_channels)
         dispatcher.setup_channels()
         # Signal start (but not ready) so the parent's `_start_event.wait()`
         # returns. Ready flag is set later by start_dispatch().
