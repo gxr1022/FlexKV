@@ -245,10 +245,10 @@ radixshmem 把 `registry` 去掉第一个 `://` 之前的 scheme 后，余下部
 | `cluster.rht_transport` | xrc / dc | client 向 RHT shard holder 写路由项 | `cluster.index_dev` |
 | `cluster.peer_index_transport` | xrc / dc | remote walk 时对 peer 节点 index 的单边 RDMA read | `cluster.index_dev` |
 | `cluster.remote_op_transport` | zmq / dc | remote insert / query 控制面，FlexKV 不使用 | zmq 走 TCP |
-| `data.transfer_protocol` + `data.transfer_devices` | rdma / tcp | 两节点 SlotStore 之间的 KV 字节搬运（mooncake），即 `get_async` 的实际拉取 | `data.transfer_devices` |
+| `data.transfer_protocol` + `data.transfer_devices` | rdma / tcp | 两节点 SlotStore 之间的 KV 字节搬运（mooncake），即 `pull_async` 的实际拉取 | `data.transfer_devices` |
 
 xrc 对每个目标一条 QP；dc 用一个 DC initiator 对所有目标，QP 数 O(1)，需要 mlx5。任一 index 面为 dc 时
-server 建 DCT，client 两个面共用一个 DCI。FlexKV 的 `get_match` 只查本地，不走前两条；`get_async`
+server 建 DCT，client 两个面共用一个 DCI。FlexKV 的 `get_match` 只查本地，不走前两条；`pull_async`
 在服务端规划时走 RHT 和 remote walk，随后的字节搬运走 mooncake。
 
 ---

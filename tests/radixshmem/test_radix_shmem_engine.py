@@ -13,7 +13,7 @@ Four parts, one file:
     the embedded radix-server subprocess.
   Part 2 — `GlobalCacheEngine.get()/put()` planning on the radixshmem backend,
     driven by synthetic matches (no region): the local GET is one H2D, the
-    prefetch plan carries a `get_async` job, the PUT arms the deferred insert;
+    prefetch plan carries a `pull_async` job, the PUT arms the deferred insert;
     plus `KVTaskEngine` completing a job-backed prefetch task.
   Part 3 — a real 2-node radixshmem cluster over RDMA in two spawned
     processes: node 0 publishes a prefix with bytes, node 1 prefetches it (the
@@ -813,7 +813,7 @@ TOKENS_PER_BLOCK = 16
 
 
 class FakeJob:
-    """Stand-in for `shmradix.GetJob`: what `_plan_prefetch` reads on return
+    """Stand-in for `shmradix.PullJob`: what `_plan_prefetch` reads on return
     (`local_hit`, `planned_hit`) and what `KVTaskEngine` polls."""
 
     def __init__(self, local_hit: int, planned_hit: int, job_id: int = 7):
@@ -1020,7 +1020,7 @@ def test_miss_is_an_empty_plan_with_the_pin_dropped():
 
 
 def test_prefetch_starts_a_peer_pull():
-    """A prefetch on a clustered tier is `RadixClient.get_async`: the plan has no
+    """A prefetch on a clustered tier is `RadixClient.pull_async`: the plan has no
     ops, the job rides on the callback handle, and the mask is the planned pull
     [local hit, planned hit)."""
     engine = _global_cache_engine()
@@ -1051,7 +1051,7 @@ def test_prefetch_without_peers_is_an_empty_plan():
 
 
 def test_prefetch_backpressure_skips_the_peer_walk():
-    """Too many pulls in flight: no get_async, so the client never blocks."""
+    """Too many pulls in flight: no pull_async, so the client never blocks."""
     engine = _global_cache_engine()
     limit = load_radixshmem_config(None).client.prefetch_max_inflight
     engine._prefetch_jobs = [FakeJob(0, 4) for _ in range(limit)]   # none done

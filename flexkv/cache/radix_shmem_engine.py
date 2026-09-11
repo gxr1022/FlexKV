@@ -13,7 +13,7 @@ Contracts:
 2. A match is a pin: `ShmRadixMatch.release()` must run on every path, or the
    prefix stays pinned for the life of the region.
 3. `match()` is local only. Peer blocks arrive through `prefetch()`
-   (`RadixClient.get_async`), which publishes them into the local tree.
+   (`RadixClient.pull_async`), which publishes them into the local tree.
 
 A region may carry an SWA pool next to FULL. `FULL|SWA` queries return the
 joint hit plus the W-block window ending there; SWA slots are addressed by
@@ -261,7 +261,7 @@ class CacheEngineRadixShmem:
                  component_mask: int = COMPONENT_MASK_FULL,
                  query_end: Optional[int] = None,
                  timeout_ms: int = 30000) -> Any:
-        """Start `get_async` for the prefix; None when the region has no peers.
+        """Start `pull_async` for the prefix; None when the region has no peers.
 
         The server pulls one peer's run into local slots and the client publishes
         it into the local tree on completion. `lock=False`: nothing stays pinned.
@@ -270,8 +270,8 @@ class CacheEngineRadixShmem:
         if not self.peer_enabled:
             return None
         hashes = self._hashes(sequence_meta, query_end)
-        job = self._client.get_async(hashes, component_mask, lock=False,
-                                     timeout_ms=int(timeout_ms), block=False)
+        job = self._client.pull_async(hashes, component_mask, lock=False,
+                                      timeout_ms=int(timeout_ms), block=False)
         flexkv_logger.debug(
             f"radixshmem prefetch on {self.shm_name}: mask={component_mask:#x} "
             f"blocks={len(hashes)} local_hit={job.local_hit} "

@@ -732,7 +732,7 @@ class TransferEngine:
             self._worker_map[TransferType.LAYERWISE] = self.layerwise_workers
 
         # radixshmem mode: the CPU pool is the radix-server's SlotStore and peer
-        # blocks are pulled by that server (RadixClient.get_async from the CE's
+        # blocks are pulled by that server (RadixClient.pull_async from the CE's
         # prefetch), so FlexKV runs no peer transfer worker of its own.
         if (self.cache_config.enable_kv_sharing and self._cpu_handle is not None
                 and not GLOBAL_CONFIG_FROM_ENV.enable_radixshmem

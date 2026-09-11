@@ -77,7 +77,7 @@ class RadixClientSettings:
     # local hit when it expires.
     prefetch_timeout_ms: int = 5000
     # Peer pulls in flight per CE process before new prefetches skip the peer
-    # walk; kept under max_outstanding so get_async never blocks.
+    # walk; kept under max_outstanding so pull_async never blocks.
     prefetch_max_inflight: int = 128
     # Uncollected jobs one RadixClient may hold.
     max_outstanding: int = 256
@@ -290,7 +290,7 @@ def _validate(cfg: RadixShmemConfig, path: str) -> None:
     if cfg.client.prefetch_max_inflight >= cfg.client.max_outstanding:
         raise RadixShmemConfigError(
             f"{path}: client.prefetch_max_inflight={cfg.client.prefetch_max_inflight} must be "
-            f"below client.max_outstanding={cfg.client.max_outstanding}, or get_async blocks")
+            f"below client.max_outstanding={cfg.client.max_outstanding}, or pull_async blocks")
     if cfg.client.prefetch_timeout_ms <= 0:
         raise RadixShmemConfigError(f"{path}: client.prefetch_timeout_ms must be > 0")
 

@@ -248,7 +248,7 @@ class KVManager:
         or one the operator started (``external``); either way every FlexKV
         process attaches by name. Peer reuse needs no Redis address book any
         more: the server resolves peers through etcd and pulls their blocks
-        itself (``RadixClient.get_async`` from the prefetch path)."""
+        itself (``RadixClient.pull_async`` from the prefetch path)."""
         from flexkv.server.shm_radix_bootstrap import (RadixServerProcess,
                                                        build_radix_server_config,
                                                        radix_socket_path)

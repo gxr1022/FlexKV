@@ -99,7 +99,7 @@ class KVTask:
     prefetch_has_swa_remote: bool = False
     prefetch_namespace: Optional[List[str]] = None
     prefetch_swa_aware: bool = False
-    # radixshmem prefetch: the RadixClient.get_async job this task waits on
+    # radixshmem prefetch: the RadixClient.pull_async job this task waits on
     # (its graph is empty), and the block range it planned to pull.
     prefetch_job: Optional[Any] = None
     prefetch_local_hit_blocks: int = 0
@@ -174,7 +174,7 @@ class KVTaskManager:
             f"[KVTaskEngine] topology: {self.model_config}"
         )
 
-        # radixshmem prefetch jobs in flight: task_id -> shmradix GetJob. Polled
+        # radixshmem prefetch jobs in flight: task_id -> shmradix PullJob. Polled
         # in _update_tasks, the thread every other task mutation runs on.
         self.prefetch_jobs: Dict[int, Any] = {}
         if GLOBAL_CONFIG_FROM_ENV.enable_radixshmem:

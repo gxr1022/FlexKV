@@ -14,7 +14,7 @@ neither allocates CPU KV memory nor moves bytes between nodes itself:
     the operator (``external``);
   * every DP scheduler process, the TE process and its transfer workers attach
     with ``shmradix.RadixClient(name)``: index operations, ``store`` (the
-    SlotStore mapping) and ``get_async`` (the server-side peer pull).
+    SlotStore mapping) and ``pull_async`` (the server-side peer pull).
 
 Naming: index ``/shmradix_<local_id>_cpu`` where ``local_id`` is the YAML's
 ``cluster.cluster_id`` (plus ``_<node_name>`` when FLEXKV_RADIX_NODE_NAME names
