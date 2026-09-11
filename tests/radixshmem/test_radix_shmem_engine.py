@@ -595,6 +595,8 @@ def test_server_config_and_geometry_check(env):
         assert cfg.cluster.rht_slots_per_bucket == 4
         assert cfg.cluster.bootstrap_timeout_sec == 120
         assert cfg.index.data_pool_ratio == 8.0
+        # one RHT registration chunk per 4096 tokens, whatever the block size
+        assert cfg.index.register_chunk_size == 4096 // cache_config.tokens_per_block
         assert cfg.data.slot_align == 1024
         assert cfg.index.full_slots == 64 and cfg.index.swa_slots == 16
         env.server(cfg)
@@ -784,6 +786,7 @@ data:
   max_pending_jobs: 7
 index:
   data_pool_ratio: 5.5
+  register_chunk_size: 64
 server:
   rpc_workers: 3
   endpoint: unix:///dev/shm/yamlsrv.sock
@@ -792,6 +795,7 @@ server:
     cfg = bootstrap.build_radix_server_config(model_config, cache_config, rcfg)
     assert cfg.index.name == "/shmradix_yamlsrv_cpu" and cfg.index.full_slots == 64
     assert cfg.index.data_pool_ratio == 5.5
+    assert cfg.index.register_chunk_size == 64        # the file wins over the derived default
     assert cfg.resolved_data_name == "/shmradix_yamlsrv_cpu_data"
     assert cfg.data.transfer_devices == ["mlx5_4"] and cfg.data.max_pending_jobs == 7
     assert cfg.data.prefault is False and cfg.data.full_slot_bytes == 32768

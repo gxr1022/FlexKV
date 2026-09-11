@@ -96,7 +96,7 @@
 | `data_pool_ratio` | `8.0` | 索引 DataPool 大小系数：`full_slots × ratio × (12 或 16)` 字节。 |
 | `background_evict_ratio` | `0.05` | 后台驱逐比例，0 关闭。 |
 | `max_nodes` | `0` | radix 节点池容量，0 自动。 |
-| `register_chunk_size` | `128` | RHT 注册粒度（block 数）。 |
+| `register_chunk_size` | `4096 / tokens_per_block` | RHT 注册粒度（block 数）。FlexKV 的默认让一段覆盖 4096 个 token，与 block 大小无关（radixshmem 自身默认 128 block）。 |
 
 禁止出现：`name`、`tokens_per_block`、`full_slots`、`swa_slots`、`swa_window_blocks`、`mamba_slots`、`evict_policy`。
 

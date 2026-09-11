@@ -44,7 +44,8 @@ import torch
 from flexkv.common.config import (GLOBAL_CONFIG_FROM_ENV, CacheConfig, LayerGroupSpec,
                                   ModelConfig, SWAPoolConfig)
 from flexkv.common.debug import flexkv_logger
-from flexkv.common.radixshmem_config import RadixShmemConfig, get_radixshmem_config
+from flexkv.common.radixshmem_config import (REGISTER_CHUNK_TOKENS, RadixShmemConfig,
+                                              get_radixshmem_config)
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 
 try:
@@ -294,13 +295,17 @@ def build_radix_server_config(model_config: ModelConfig,
     if rcfg is None:
         rcfg = get_radixshmem_config()
     geo = expected_geometry(model_config, cache_config)
+    index_kwargs = dict(rcfg.index)
+    # an RHT registration chunk covers REGISTER_CHUNK_TOKENS tokens unless the file says otherwise
+    index_kwargs.setdefault("register_chunk_size",
+                            max(1, REGISTER_CHUNK_TOKENS // geo.tokens_per_block))
     index = shmradix.IndexConfig(
         name=radix_index_name(rcfg.local_id),
         tokens_per_block=geo.tokens_per_block,
         full_slots=geo.full_slots,
         swa_slots=geo.swa_slots,
         swa_window_blocks=geo.swa_window_blocks,
-        **rcfg.index,
+        **index_kwargs,
     )
     data = shmradix.DataPlaneConfig(
         data_bytes=geo.data_bytes,
@@ -318,7 +323,8 @@ def build_radix_server_config(model_config: ModelConfig,
     cfg = shmradix.RadixServerConfig(index=index, data=data, cluster=cluster, **server_kwargs)
     flexkv_logger.info(
         f"radixshmem server config for {index.name}: {geo.describe()}, "
-        f"{rcfg.describe()}, hugepage_path={cfg.hugepage_path or '(shm)'}, "
+        f"{rcfg.describe()}, register_chunk_size={index.register_chunk_size}, "
+        f"hugepage_path={cfg.hugepage_path or '(shm)'}, "
         f"prefault={data.prefault}, transfer_devices={data.transfer_devices or '(all)'}")
     return cfg
 

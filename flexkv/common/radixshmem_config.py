@@ -37,7 +37,13 @@ from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 SECTIONS = ("cluster", "data", "index", "server", "client")
 
 # Values FlexKV sets differently from radixshmem's own defaults; anything not
-# listed takes the shmradix dataclass default.
+# listed takes the shmradix dataclass default. One more default depends on the
+# geometry and is resolved in shm_radix_bootstrap.build_radix_server_config:
+# index.register_chunk_size = REGISTER_CHUNK_TOKENS // tokens_per_block, so an
+# RHT registration chunk covers REGISTER_CHUNK_TOKENS tokens whatever the block
+# size (radixshmem's own default is 128 blocks).
+REGISTER_CHUNK_TOKENS = 4096
+
 FLEXKV_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "cluster": {
         "cluster_id": "flexkv",
