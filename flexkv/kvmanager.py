@@ -151,7 +151,11 @@ class KVManager:
         if self.enable_radixshmem:
             self._init_radix_shmem_path(event_collector)
         elif self.server_client_mode:
-            if self.server_launch_mode == "embedded" and dp_client_id == 0:
+            # One KVServer per node: with node-local DP the first rank of each
+            # node owns it, so nodes 1..n-1 get their own server instead of
+            # waiting on node 0's. Without node-local DP local_dp_client_id
+            # equals dp_client_id and this is the previous condition.
+            if self.server_launch_mode == "embedded" and self.local_dp_client_id == 0:
                 self.server_handle = KVServer.create_server(model_config=model_config,
                                                             cache_config=cache_config,
                                                             gpu_register_port=self.gpu_register_port,

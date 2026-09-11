@@ -511,9 +511,14 @@ class FlexKVConfig:
         enable_dp_attention = bool(server_args.enable_dp_attention)
         attn_cp_size = int(getattr(server_args, 'attn_cp_size', 1))
         kv_cache_dtype = getattr(server_args, 'kv_cache_dtype', None)
-        local_dp_size = self.get_sglang_node_local_dp_size(server_args) \
-            if GLOBAL_CONFIG_FROM_ENV.enable_radixshmem \
-            else None
+        # Node-local DP is a property of the SGLang placement, not of the tier
+        # underneath it: with DP attention and pp_size == 1, a dp_size divisible
+        # by nnodes puts every DP group on a single node, so FlexKV forms one
+        # instance per node whatever the shared tier is (radix-shmem, or
+        # mooncake-store, where the store itself carries cross-node reuse).
+        # get_sglang_node_local_dp_size returns None for every placement where
+        # that does not hold, which leaves the cross-node TP/PP path untouched.
+        local_dp_size = self.get_sglang_node_local_dp_size(server_args)
 
         if dp_rank is None and GLOBAL_CONFIG_FROM_ENV.enable_radixshmem and sglang_dp_size > 1:
             # Every DP process would derive dp_client_id 0: the same radix-server
@@ -525,21 +530,16 @@ class FlexKVConfig:
         cp_rank = 0 if cp_rank is None else int(cp_rank)
         if local_dp_size is not None:
             logger.info(
-                "[FlexKV SGLang] Enabling node-local radix-shmem DP: "
-                "global_dp_size=%d, local_dp_size=%d, node_rank=%d",
+                "[FlexKV SGLang] Enabling node-local DP (one FlexKV instance per "
+                "node): global_dp_size=%d, local_dp_size=%d, node_rank=%d",
                 sglang_dp_size,
                 local_dp_size,
                 int(node_rank),
             )
-        elif (
-            GLOBAL_CONFIG_FROM_ENV.enable_radixshmem
-            and enable_dp_attention
-            and sglang_dp_size > 1
-            and int(nnodes) > 1
-        ):
+        elif enable_dp_attention and sglang_dp_size > 1 and int(nnodes) > 1:
             logger.warning(
-                "[FlexKV SGLang] Node-local radix-shmem DP is not enabled for "
-                "this DP/PP placement; preserving the legacy cross-node path."
+                "[FlexKV SGLang] Node-local DP is not available for this DP/PP "
+                "placement; preserving the legacy cross-node path."
             )
 
         attn_dp_size = sglang_dp_size if enable_dp_attention else 1

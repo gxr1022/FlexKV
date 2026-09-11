@@ -185,7 +185,10 @@ class ModelConfig:
     # and token_size_in_bytes/num_cpu_blocks are computed by summing across groups.
     layer_groups: Optional[List[LayerGroupSpec]] = None
 
-    # Optional SGLang DP-Attention override used only by the radix-shmem path.
+    # SGLang DP-Attention node-local width. Set when every DP group lives on
+    # one node, which makes FlexKV form one instance per node instead of one
+    # spanning the cluster (FlexKVConfig.get_sglang_node_local_dp_size).
+    # None keeps the cross-node path.
     local_dp_size: Optional[int] = None
 
     # ------------------------------------------------------------------
@@ -516,7 +519,8 @@ class RankInfo:
 
     @property
     def local_dp_client_id(self) -> int:
-        """Dense per-instance, node-local id used for shared-memory IPC."""
+        """Dense node-local id: which rank owns this node's KVServer or
+        radix-server and its TE channel, and the shared-memory IPC names."""
         local_dp_size = self.model_config.local_dp_size
         if local_dp_size is None:
             return self.dp_client_id
