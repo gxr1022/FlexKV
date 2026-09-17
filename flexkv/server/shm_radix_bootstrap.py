@@ -252,7 +252,10 @@ def check_geometry(client: "shmradix.RadixClient", expected: RadixGeometry,
         diffs.append("server is index-only (no SlotStore); FlexKV needs the data plane")
     else:
         store = client.store
-        stride = int(store.pool(shmradix.ComponentType.FULL).slot_bytes)
+        # store is a shmradix._data.SlotStore: it registers its own
+        # ComponentType (distinct from shmradix.ComponentType, i.e. _core's,
+        # even though both are named "ComponentType") or takes a plain int.
+        stride = int(store.pool(int(shmradix.ComponentType.FULL)).slot_bytes)
         if stride != expected.full_slot_bytes:
             diffs.append(f"FULL stride server={stride} flexkv={expected.full_slot_bytes} "
                          f"(slot_align must divide the block size)")
@@ -269,7 +272,7 @@ def check_geometry(client: "shmradix.RadixClient", expected: RadixGeometry,
                 diffs.append(f"SWA window server={swa.get('window_blocks')} "
                              f"flexkv={expected.swa_window_blocks}")
             if client.info.data_plane:
-                stride = int(client.store.pool(shmradix.ComponentType.SWA).slot_bytes)
+                stride = int(client.store.pool(int(shmradix.ComponentType.SWA)).slot_bytes)
                 if stride != expected.swa_slot_bytes:
                     diffs.append(f"SWA stride server={stride} flexkv={expected.swa_slot_bytes}")
     elif swa is not None:
