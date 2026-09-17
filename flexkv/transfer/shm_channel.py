@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# cython: boundscheck=True, wraparound=True
 """
 Shared-memory IPC channel for CacheEngine ↔ TransferEngine communication in
 multi-DP FlexKV.

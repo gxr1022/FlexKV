@@ -1,3 +1,4 @@
+# cython: boundscheck=True, wraparound=True
 """GET / PUT / PREFETCH planning on the radixshmem CPU tier.
 
 `RadixShmemCacheEngine` is `GlobalCacheEngine` with the CPU tier backed by a

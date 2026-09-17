@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# cython: boundscheck=True, wraparound=True
 """The radixshmem-mode configuration file (``FLEXKV_RADIXSHMEM_CONFIG_PATH``).
 
 One YAML, identical on every node of a cluster, with five sections:

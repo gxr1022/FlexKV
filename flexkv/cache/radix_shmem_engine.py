@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# cython: boundscheck=True, wraparound=True
 """
 The radixshmem CPU tier: one process's `shmradix.RadixClient` on the node's
 radix-server (index shm + SlotStore + RDMA engine, see
@@ -229,7 +230,11 @@ class CacheEngineRadixShmem:
         common_hit = int(qr.common_hit)
 
         fragments = list(qr.full_fragments)  # local_only: at most one
-        local_slots = (np.asarray(fragments[-1][2], dtype=np.int64)
+        if len(fragments) > 1:
+            self._finalize_and_raise(
+                qr, f"radixshmem local query returned {len(fragments)} fragments; "
+                    f"a local_only query yields at most one")
+        local_slots = (np.asarray(fragments[0][2], dtype=np.int64)
                        if fragments else _empty_i64())
         if len(local_slots) != common_hit:
             self._finalize_and_raise(
