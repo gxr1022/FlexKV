@@ -294,14 +294,11 @@ class StorageEngine:
 
         kind = ComponentType.SWA if is_swa else ComponentType.FULL
         store = self._radix_client.store
-        # store is a shmradix._data.SlotStore: it registers its own
-        # ComponentType (distinct from shmradix._core's `kind` above, though
-        # both print as "ComponentType") or takes a plain int.
-        if not store.has_pool(int(kind)):
+        if not store.has_pool(kind):
             raise ValueError(
                 f"radix-server SlotStore {store.name} has no {kind.name} pool but the "
                 f"FlexKV configuration needs one")
-        pool = store.pool(int(kind))
+        pool = store.pool(kind)
         block_bytes = layout_block_bytes(layout, dtype)
         if int(pool.num_slots) != int(layout.num_block):
             raise ValueError(
