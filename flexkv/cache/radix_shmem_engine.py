@@ -229,7 +229,12 @@ class CacheEngineRadixShmem:
         common_hit = int(qr.common_hit)
 
         fragments = list(qr.full_fragments)  # local_only: at most one
-        local_slots = (np.asarray(fragments[-1][2], dtype=np.int64)
+        # setup.py compiles this module with wraparound=False, so `fragments[-1]`
+        # is not the usual Python "last element" access: Cython emits a raw,
+        # unchecked negative offset (no `+= len(fragments)` adjustment), which
+        # reads before the start of the list's storage regardless of whether
+        # fragments is empty -- undefined behavior that segfaulted here.
+        local_slots = (np.asarray(fragments[len(fragments) - 1][2], dtype=np.int64)
                        if fragments else _empty_i64())
         if len(local_slots) != common_hit:
             self._finalize_and_raise(
