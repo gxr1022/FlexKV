@@ -346,7 +346,11 @@ def slot_store_pool_tensor(store: Any, kind: Any, dtype: torch.dtype,
     store object is pinned on the tensor: dropping the mapping while the
     tensor is in use would leave dangling addresses.
     """
-    view = store.pool_view(kind)
+    # `store` is a shmradix._data.SlotStore: it registers its own
+    # ComponentType, a distinct pybind11 type from shmradix._core's (what
+    # callers typically pass in) even though both are named "ComponentType" —
+    # pass the int value across that module boundary.
+    view = store.pool_view(int(kind))
     tensor = torch.frombuffer(view, dtype=torch.uint8)
     if dtype != torch.uint8:
         if tensor.numel() % dtype.itemsize:
